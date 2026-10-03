@@ -19,5 +19,7 @@ urlpatterns = [
     path("by-key/", views.by_api_key),
     path("drf/plain/", views.PlainAPIView.as_view()),
     path("drf/login/", views.LoginAPIView.as_view()),
+    path("bench/", views.ok),
+    path("bench-open/", views.ok),
     path("trafficwatch/", include("django_trafficwatch.urls")),
 ]

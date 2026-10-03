@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.5.0 — unreleased
+## Unreleased
+
+### Added
+- Acceptance suite also runs on Memcached; `acceptance/deploy/` multi-worker tests (gunicorn
+  and uvicorn x4 workers, Redis and Memcached stores, 400 concurrent requests against a budget
+  of 50) and `deploy/bench.py`; CI jobs `test-memcached` and deploy steps in `acceptance`.
+  Measured middleware overhead on a 4-worker gunicorn box: about 1 ms (fixed), 1.4 ms (redis),
+  2 ms (sliding) per request at p50.
+
+## 0.5.0 — 2026-10-03
 
 ### Changed
 - **Unknown top-level `TRAFFICWATCH` keys refuse to start.** A typo such as `MAX_REQUEST` used
@@ -24,7 +33,7 @@
 ### Removed
 - `trafficwatch.W001` (replaced by `E016`).
 
-## 0.4.0 — unreleased
+## 0.4.0 — 2026-10-03
 
 Fixes from a load / behaviour test of 0.3.0.
 
@@ -61,7 +70,7 @@ Fixes from a load / behaviour test of 0.3.0.
 ### Removed
 - Nothing. `HitResult.just_exceeded` still works for backends that do not set `first`.
 
-## 0.3.0 — unreleased
+## 0.3.0 — 2026-10-03
 
 ### Security / production safety
 - **Fail-open on cache outage.** A cache exception (Redis down) no longer turns every request
