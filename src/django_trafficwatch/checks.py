@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from django.conf import settings
-from django.core.checks import CheckMessage, Error, Tags, Warning, register
+from django.core.checks import CheckMessage, Error, Info, Tags, Warning, register
 from django.utils.module_loading import import_string
 
 from .conf import (
@@ -41,10 +41,11 @@ def check_trafficwatch_settings(app_configs: Any, **kwargs: Any) -> list[CheckMe
     unknown = sorted(set(user) - set(DEFAULTS))
     if unknown:
         errors.append(
-            Warning(
-                f"Unknown TRAFFICWATCH keys: {unknown}.",
+            Error(
+                f"Unknown TRAFFICWATCH keys: {unknown}. The middleware refuses to start with "
+                "them, since a typo (MAX_REQUEST) would silently fall back to the default.",
                 hint=f"Known keys: {sorted(DEFAULTS)}",
-                id="trafficwatch.W001",
+                id="trafficwatch.E016",
             )
         )
 
@@ -113,15 +114,17 @@ def check_trafficwatch_settings(app_configs: Any, **kwargs: Any) -> list[CheckMe
                 id="trafficwatch.E008",
             )
         )
-    elif "locmem" in cache_backend and not settings.DEBUG:
-        errors.append(
-            Warning(
-                "TRAFFICWATCH uses LocMemCache, which is per-process: limits are not shared "
-                "between workers or hosts.",
-                hint="Point CACHE_ALIAS at a Redis or Memcached cache in production.",
-                id="trafficwatch.W002",
-            )
+    elif "locmem" in cache_backend:
+        locmem_msg = (
+            "TRAFFICWATCH uses LocMemCache, which is per-process: limits are not shared "
+            "between workers or hosts, and `manage.py trafficwatch_recent` (a separate "
+            "process) always sees an empty list."
         )
+        locmem_hint = "Point CACHE_ALIAS at a Redis or Memcached cache in production."
+        if settings.DEBUG:
+            errors.append(Info(locmem_msg, hint=locmem_hint, id="trafficwatch.I001"))
+        else:
+            errors.append(Warning(locmem_msg, hint=locmem_hint, id="trafficwatch.W002"))
     elif "dummycache" in cache_backend:
         errors.append(
             Error(

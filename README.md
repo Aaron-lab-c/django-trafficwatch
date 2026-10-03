@@ -55,7 +55,7 @@ TRAFFICWATCH = {
         # regex key
         r"re:^/api/v\d+/search/": {"MAX_REQUESTS": 30},
     },
-    "EXEMPT_PATHS": ["/static/", "/media/", "/health/"],
+    "EXEMPT_PATHS": ["/static/", "/media/", "/favicon.ico", "/health/"],
     "EXEMPT_CLIENTS": ["10.0.0.0/8"],  # monitoring, internal callers
     "EXEMPT_FUNC": lambda request: request.user.is_superuser,
     "TRUSTED_PROXIES": ["10.0.0.0/8"],  # only then is X-Forwarded-For honoured
@@ -68,8 +68,9 @@ TRAFFICWATCH = {
 
 Run `python manage.py check` to validate the configuration (typos in keys, bad regexes,
 unimportable callables, middleware ordering, LocMem in production, ...). The middleware also
-validates everything when it is instantiated, so a typo raises `ImproperlyConfigured` at
-process start rather than on the first request.
+validates everything when it is instantiated, so a typo such as `MAX_REQUEST` or an
+unimportable dotted path raises `ImproperlyConfigured` at process start rather than silently
+falling back to a default or failing on the first request.
 
 ## Per-view control
 
@@ -118,9 +119,19 @@ rounded *up*, so waiting exactly that long is always enough.
 Requests that never reach a view are counted too (`COUNT_UNROUTED`, default `True`): 404s from
 the URL resolver and responses produced by a middleware below `TrafficWatchMiddleware` are
 matched against `PATH_RULES` / the global rule, so a scanner probing unknown URLs is limited
-like everyone else. Responses produced by middleware *above* ours (for example the
-`APPEND_SLASH` redirect of `CommonMiddleware`) never reach it; place `TrafficWatchMiddleware`
-higher if you need those counted.
+like everyone else. `CommonMiddleware`'s `APPEND_SLASH` redirect is counted as well: Django
+produces the 404 first and only turns it into a 301 on the way out, after this middleware has
+seen it (and a client already over its limit gets the 429 instead of the redirect). Only a
+response produced by a middleware *above* ours in its `process_request` (for example
+`PREPEND_WWW`, or a security redirect) is invisible; place `TrafficWatchMiddleware` higher if
+you need those counted.
+
+Side effect to know about: a 404 for a resource the browser requests on its own, such as a
+missing `/favicon.ico` or `/apple-touch-icon.png`, is charged to the visitor's *global* quota
+(it only affects paths without a `PATH_RULES` entry). `/favicon.ico` is in the default
+`EXEMPT_PATHS` for that reason; if you override `EXEMPT_PATHS`, keep it in, and add any
+other well-known paths your pages reference but do not serve. Set `COUNT_UNROUTED = False`
+to turn the behaviour off entirely.
 
 Rules are matched against `request.path`. Set `MATCH_PATH_INFO = True` to match
 `request.path_info` instead when the project is mounted under a `SCRIPT_NAME` prefix.
@@ -275,7 +286,7 @@ TRAFFICWATCH = {"BLOCK_RESPONSE": "myproject.views.too_many", ...}
 | `PATH_RULES` | `{}` | `{prefix or "re:regex": rule or [rules]}`; rule keys `WINDOW_SECONDS`, `MAX_REQUESTS`, `METHODS`, `NAME`, `BLOCK`, `KEY_FUNC` |
 | `COUNT_UNROUTED` | `True` | Also count requests that never reach a view (404s, early-middleware responses) |
 | `MATCH_PATH_INFO` | `False` | Match paths against `request.path_info` instead of `request.path` |
-| `EXEMPT_PATHS` | `["/static/", "/media/"]` | Path prefixes never counted |
+| `EXEMPT_PATHS` | `["/static/", "/media/", "/favicon.ico"]` | Path prefixes never counted |
 | `EXEMPT_METHODS` | `["OPTIONS"]` | HTTP methods never counted |
 | `EXEMPT_CLIENTS` | `[]` | IPs / CIDR networks never counted (resolved client IP) |
 | `EXEMPT_FUNC` | `None` | Dotted path or callable `(request) -> bool`; true = never counted |
@@ -309,7 +320,8 @@ TRAFFICWATCH = {"BLOCK_RESPONSE": "myproject.views.too_many", ...}
 - Counting happens before the view runs, so requests rejected by authentication still consume
   quota. That is what makes brute-force protection work.
 - `LocMemCache` is per process. Use Redis or Memcached in production (`manage.py check` warns
-  when `DEBUG` is off). `FileBasedCache` and `DatabaseCache` have a non-atomic `incr` and lose
+  when `DEBUG` is off and prints an info message when it is on; `trafficwatch_recent` explains
+  why it sees nothing). `FileBasedCache` and `DatabaseCache` have a non-atomic `incr` and lose
   counts under concurrency (`trafficwatch.W007`); `DummyCache` never limits anything (`E014`).
 - Deploy with `manage.py check --deploy --fail-level WARNING` so a misconfiguration stops the
   rollout; the middleware itself refuses to start on invalid values (`MAX_REQUESTS=0`, a bad
@@ -319,16 +331,29 @@ TRAFFICWATCH = {"BLOCK_RESPONSE": "myproject.views.too_many", ...}
 
 ```bash
 pip install -e ".[dev,typing]"
-pytest                                        # LocMem
+pytest                                        # unit suite, LocMem
 TW_REDIS_URL=redis://localhost:6379/1 pytest  # the same suite against Redis + Redis-only tests
-ruff check . && ruff format --check src tests
+pytest -c acceptance/pytest.ini               # acceptance suite (see below)
+ruff check . && ruff format --check src tests acceptance
 mypy --strict src
+```
+
+`acceptance/` is a stand-alone Django project configured the way this README recommends. Its
+tests drive the package only through settings, public decorators and HTTP, one scenario per
+documented feature (limits, rules, identity, exemptions, alerts, inspection, outage, lockout,
+unrouted requests, DRF, ASGI, configuration errors). CI builds the wheel, installs it in a
+clean environment and runs that suite from outside the repository, so a packaging mistake
+fails the build too. Run it yourself against an installed release with:
+
+```bash
+cp -r acceptance /tmp/acc && cd /tmp/acc && pip install django-trafficwatch pytest pytest-django pytest-asyncio djangorestframework
+pytest -c acceptance/pytest.ini acceptance
 ```
 
 ## Release
 
 1. Bump `__version__` in `src/django_trafficwatch/__init__.py` and update `CHANGELOG.md`.
-2. `git tag v0.4.0 && git push origin v0.4.0`
+2. `git tag v0.5.0 && git push origin v0.5.0`
 3. The `publish.yml` workflow runs tests, checks the tag matches the version, builds, and
    uploads to PyPI via Trusted Publishing.
 

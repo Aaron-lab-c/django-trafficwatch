@@ -6,9 +6,11 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from django.core.cache import caches
 from django.core.management.base import BaseCommand, CommandParser
 
 from django_trafficwatch import stats
+from django_trafficwatch.conf import tw_settings
 
 
 class Command(BaseCommand):
@@ -28,6 +30,12 @@ class Command(BaseCommand):
             return
 
         rows = stats.recent_violations(options["limit"])
+        if not rows and "locmem" in type(caches[tw_settings.CACHE_ALIAS]).__name__.lower():
+            self.stderr.write(
+                f"Note: CACHES[{tw_settings.CACHE_ALIAS!r}] is LocMemCache, which lives inside "
+                "each process. This command runs in its own process and cannot see what the "
+                "web workers recorded; use a Redis or Memcached cache to share the data."
+            )
         if options["json"]:
             self.stdout.write(json.dumps(rows, indent=2, default=str))
             return

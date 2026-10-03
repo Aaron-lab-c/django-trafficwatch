@@ -30,6 +30,11 @@ README/ARCHITECTURE updates. Run the suite with `pytest` (and
 - Numeric / boolean settings validated at startup; `W007` / `E014` for non-atomic or dummy
   caches; raising `KEY_FUNC` / `EXEMPT_FUNC` degrade instead of 500.
 
+## Done in 0.5.0
+
+- Unknown top-level keys fail at startup (`E016`); LocMem reported under `DEBUG` (`I001`);
+  `/favicon.ico` exempt by default; `APPEND_SLASH` / 404 side effects documented.
+
 ## Open
 
 1. **Exact sliding log for Redis.** An optional `"redis-log"` mode using a sorted set per
