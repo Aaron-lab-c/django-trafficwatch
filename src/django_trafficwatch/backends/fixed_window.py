@@ -38,11 +38,15 @@ class FixedWindowBackend(BaseBackend):
         rejected = any(r.exceeded and enforce for _k, _t, r, enforce in counted)
         results = []
         for spec, (key, reset_in, result, _enforce) in zip(specs, counted):
-            client, rule, _w, _l, _e = spec_parts(spec)
+            client, rule, _w, limit, _e = spec_parts(spec)
+            count = result.count
             if rejected:
                 self._decr(key)
+                # Concurrent rejections see limit + k transiently; after the rollback each
+                # of them was "one more than the limit", so report exactly that.
+                count = min(count, limit + 1)
             first = self.first_crossing(client, rule, reset_in) if result.exceeded else False
-            results.append(HitResult(result.count, result.limit, reset_in, first))
+            results.append(HitResult(count, limit, reset_in, first))
         return results
 
     def peek(self, client: str, rule: str, window: int, limit: int) -> HitResult:

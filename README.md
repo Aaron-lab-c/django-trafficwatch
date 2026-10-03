@@ -369,7 +369,7 @@ cd acceptance && TW_REDIS_URL=redis://localhost:6379/5 TW_MEMCACHED=localhost:11
 ## Release
 
 1. Bump `__version__` in `src/django_trafficwatch/__init__.py` and update `CHANGELOG.md`.
-2. `git tag v0.5.0 && git push origin v0.5.0`
+2. `git tag v0.5.1 && git push origin v0.5.1`
 3. The `publish.yml` workflow runs tests, checks the tag matches the version, builds, and
    uploads to PyPI via Trusted Publishing.
 

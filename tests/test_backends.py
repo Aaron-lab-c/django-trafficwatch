@@ -216,3 +216,19 @@ def test_raw_redis_client_detection():
     assert raw_redis_client(object()) is None
     if "locmem" in type(caches["default"]).__name__.lower():
         assert raw_redis_client(caches["default"]) is None
+
+
+@pytest.mark.parametrize("backend_cls", [FixedWindowBackend, SlidingWindowBackend])
+def test_rejected_count_is_limit_plus_one_even_when_racing(frozen, backend_cls):
+    """Simulate two in-flight rejections: the second one sees limit + 2 before rollback but
+    must still report limit + 1, so logs and signals read 'count=4 limit=3' deterministically."""
+    b = backend_cls("default", "t")
+    for _ in range(3):
+        b.hit("c", "*", 10, 3)
+    # Another request has incremented but not yet rolled back:
+    key = b._key("c", "*", int(1000.0 // 10))
+    b.cache.incr(key)
+    r = b.hit("c", "*", 10, 3)
+    assert r.exceeded and r.count == 4 and r.remaining == 0
+    b.cache.decr(key)  # the other request rolls back
+    assert b.peek("c", "*", 10, 3).count == 3

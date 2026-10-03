@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 — unreleased
+
+### Fixed
+- Under concurrent rejections the first-crossing notification could report
+  `count = limit + k` (e.g. 52/50) because several requests had incremented the counter
+  before all of them were rolled back. A rejected request now reports exactly `limit + 1`
+  (admission was already exact; found by the new multi-worker test).
 
 ### Added
 - Acceptance suite also runs on Memcached; `acceptance/deploy/` multi-worker tests (gunicorn

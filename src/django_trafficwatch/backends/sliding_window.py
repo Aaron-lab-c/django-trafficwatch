@@ -44,6 +44,10 @@ def two_bucket_result(
     rolled back, so ``reset_in`` is computed from the stored value (``current - 1``)."""
     est = estimate(previous, current, elapsed)
     stored = current if counted else current - 1
+    if not counted:
+        # Concurrent rejections inflate the transient value (limit + k); after the rollback
+        # every one of them saw "one more than the limit", so report exactly that.
+        est = min(est, limit + 1)
     if est >= limit:
         wait = seconds_until_allowed(previous, stored, elapsed, window, limit)
         reset_in = ceil_seconds(wait)
