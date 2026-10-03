@@ -144,6 +144,8 @@ class RuleSet:
     def __init__(self, path_rules: Mapping[str, Any], default_window: int, default_limit: int):
         if not isinstance(path_rules, Mapping):
             raise RuleConfigError("PATH_RULES must be a dict")
+        default_window = _positive_int(default_window, "WINDOW_SECONDS", "TRAFFICWATCH")
+        default_limit = _positive_int(default_limit, "MAX_REQUESTS", "TRAFFICWATCH")
         self.global_rule = Rule(name="*", window=default_window, limit=default_limit)
         self._regex: list[tuple[re.Pattern[str], tuple[Rule, ...]]] = []
         self._prefix: list[tuple[str, tuple[Rule, ...]]] = []

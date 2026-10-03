@@ -11,7 +11,15 @@ from django.conf import settings
 from django.core.checks import CheckMessage, Error, Tags, Warning, register
 from django.utils.module_loading import import_string
 
-from .conf import _IMPORTABLE, DEFAULTS, HEADER_STYLES, parse_lockout, parse_networks, tw_settings
+from .conf import (
+    _IMPORTABLE,
+    BOOLEAN_SETTINGS,
+    DEFAULTS,
+    HEADER_STYLES,
+    parse_lockout,
+    parse_networks,
+    tw_settings,
+)
 from .rules import RuleConfigError, RuleSet
 
 MIDDLEWARE_PATH = "django_trafficwatch.middleware.TrafficWatchMiddleware"
@@ -47,12 +55,12 @@ def check_trafficwatch_settings(app_configs: Any, **kwargs: Any) -> list[CheckMe
                 Error(f"TRAFFICWATCH[{name!r}] must be a positive integer.", id="trafficwatch.E002")
             )
 
+    def _sane(name: str) -> int:  # E002 already covers a bad value; don't double-report
+        value = user.get(name, DEFAULTS[name])
+        return int(value) if _is_positive_int(value) else 1
+
     try:
-        RuleSet(
-            user.get("PATH_RULES", {}),
-            user.get("WINDOW_SECONDS", DEFAULTS["WINDOW_SECONDS"]) or 1,
-            user.get("MAX_REQUESTS", DEFAULTS["MAX_REQUESTS"]) or 1,
-        )
+        RuleSet(user.get("PATH_RULES", {}), _sane("WINDOW_SECONDS"), _sane("MAX_REQUESTS"))
     except (RuleConfigError, ImportError, TypeError) as exc:
         errors.append(Error(f"Invalid TRAFFICWATCH PATH_RULES: {exc}", id="trafficwatch.E003"))
 
@@ -114,6 +122,24 @@ def check_trafficwatch_settings(app_configs: Any, **kwargs: Any) -> list[CheckMe
                 id="trafficwatch.W002",
             )
         )
+    elif "dummycache" in cache_backend:
+        errors.append(
+            Error(
+                "TRAFFICWATCH uses DummyCache: nothing is ever counted and no limit is enforced.",
+                hint="Point CACHE_ALIAS at a Redis or Memcached cache.",
+                id="trafficwatch.E014",
+            )
+        )
+    elif "filebased" in cache_backend or ".db.databasecache" in cache_backend:
+        errors.append(
+            Warning(
+                f"TRAFFICWATCH uses {caches[alias].get('BACKEND')}, whose incr() is a "
+                "non-atomic get/set: concurrent requests lose counts and limits are not "
+                "reliably enforced (file locking errors also trigger fail-open).",
+                hint="Point CACHE_ALIAS at a Redis or Memcached cache.",
+                id="trafficwatch.W007",
+            )
+        )
 
     try:
         parse_networks(user.get("EXEMPT_CLIENTS", []), "EXEMPT_CLIENTS")
@@ -134,6 +160,22 @@ def check_trafficwatch_settings(app_configs: Any, **kwargs: Any) -> list[CheckMe
     except RuleConfigError as exc:
         errors.append(Error(f"TRAFFICWATCH['{exc}", id="trafficwatch.E011"))
 
+    status = user.get("BLOCK_STATUS", DEFAULTS["BLOCK_STATUS"])
+    if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+        errors.append(
+            Error(
+                "TRAFFICWATCH['BLOCK_STATUS'] must be an HTTP status code.", id="trafficwatch.E015"
+            )
+        )
+    recent = user.get("RECENT_VIOLATIONS", DEFAULTS["RECENT_VIOLATIONS"])
+    if isinstance(recent, bool) or not isinstance(recent, int) or recent < 0:
+        errors.append(
+            Error(
+                "TRAFFICWATCH['RECENT_VIOLATIONS'] must be a non-negative integer.",
+                id="trafficwatch.E015",
+            )
+        )
+
     style = user.get("HEADERS_STYLE", DEFAULTS["HEADERS_STYLE"])
     if style not in HEADER_STYLES:
         errors.append(
@@ -143,7 +185,7 @@ def check_trafficwatch_settings(app_configs: Any, **kwargs: Any) -> list[CheckMe
             )
         )
 
-    for name in ("FAIL_OPEN", "RESET_AS_EPOCH", "MATCH_PATH_INFO", "HEADERS", "BLOCK"):
+    for name in BOOLEAN_SETTINGS:
         if not isinstance(user.get(name, DEFAULTS[name]), bool):
             errors.append(
                 Error(f"TRAFFICWATCH[{name!r}] must be a boolean.", id="trafficwatch.E013")

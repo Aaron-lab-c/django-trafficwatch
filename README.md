@@ -7,7 +7,7 @@ Configurable traffic monitoring and rate limiting for Django, as a single middle
 Set a time window and a request count, globally, per path, per method, or per view.
 Observe first, block later.
 
-- Fixed-window and sliding-window counters on top of Django's cache framework (Redis, Memcached, LocMem)
+- Fixed-window counters (default) on top of Django's cache framework (Redis, Memcached, LocMem); sliding-window and single-round-trip Redis variants when the burst at window edges matters
 - Rules per path prefix or regex, per HTTP method, several limits on one endpoint (5/min **and** 100/day)
 - `@trafficwatch_rule` / `@trafficwatch_exempt` for function and class-based views, stackable
 - Observe-only mode (`BLOCK=False`), globally or per rule, to measure before enforcing
@@ -60,7 +60,7 @@ TRAFFICWATCH = {
     "EXEMPT_FUNC": lambda request: request.user.is_superuser,
     "TRUSTED_PROXIES": ["10.0.0.0/8"],  # only then is X-Forwarded-For honoured
     "BLOCK": False,  # start in observe-only mode, flip to True when happy
-    "BACKEND": "sliding",  # "fixed" (default), "sliding" or "redis"
+    "BACKEND": "fixed",  # default; "sliding" / "redis" smooth the burst at window edges
     "LOCKOUT": {"VIOLATIONS": 3, "WINDOW_SECONDS": 600, "DURATION_SECONDS": 900},
     "ON_EXCEEDED": "myproject.alerts.notify",
 }
@@ -107,6 +107,20 @@ class LoginView(View): ...
 
 Every applicable rule is counted independently; the response headers describe the rule closest
 to its limit and `Retry-After` is the longest wait among the rules that blocked.
+
+**Rejected requests are not counted.** A request is counted against every rule first; if any
+enforced rule is over, the increments are rolled back. So a client sending 11 requests a
+minute against a 10/min limit gets 10 through and one 429 (with either backend), and a request
+turned away by the per-minute rule does not eat into the daily one. Rules in observe mode
+(`BLOCK=False`) keep counting everything, since those requests are served. `Retry-After` is
+rounded *up*, so waiting exactly that long is always enough.
+
+Requests that never reach a view are counted too (`COUNT_UNROUTED`, default `True`): 404s from
+the URL resolver and responses produced by a middleware below `TrafficWatchMiddleware` are
+matched against `PATH_RULES` / the global rule, so a scanner probing unknown URLs is limited
+like everyone else. Responses produced by middleware *above* ours (for example the
+`APPEND_SLASH` redirect of `CommonMiddleware`) never reach it; place `TrafficWatchMiddleware`
+higher if you need those counted.
 
 Rules are matched against `request.path`. Set `MATCH_PATH_INFO = True` to match
 `request.path_info` instead when the project is mounted under a `SCRIPT_NAME` prefix.
@@ -159,9 +173,14 @@ from django_trafficwatch import traffic_exceeded
 def on_exceeded(sender, request, info, **kwargs): ...
 ```
 
-Both fire **once per client per window**, on the first request that crosses the limit. The
-same event is logged at `WARNING` on the `django_trafficwatch` logger with the info dict attached
-as `record.trafficwatch`, so JSON log handlers get structured fields for free.
+Both fire **once per client per window**, on the first request that is turned away (an atomic
+marker guarantees exactly one event however hard the client hammers). The same event is logged
+at `WARNING` on the `django_trafficwatch` logger with the info dict attached as
+`record.trafficwatch`, so JSON log handlers get structured fields for free.
+
+Hooks never break a request: an exception in `ON_EXCEEDED` is logged; a raising `KEY_FUNC`
+falls back to keying on the client IP; a raising `EXEMPT_FUNC` exempts nothing. The first two
+kinds are logged at `ERROR` with the traceback, throttled like the cache-outage log.
 
 A Prometheus counter is a three-line receiver:
 
@@ -254,6 +273,7 @@ TRAFFICWATCH = {"BLOCK_RESPONSE": "myproject.views.too_many", ...}
 | `WINDOW_SECONDS` | `60` | Global window length |
 | `MAX_REQUESTS` | `100` | Global limit per window |
 | `PATH_RULES` | `{}` | `{prefix or "re:regex": rule or [rules]}`; rule keys `WINDOW_SECONDS`, `MAX_REQUESTS`, `METHODS`, `NAME`, `BLOCK`, `KEY_FUNC` |
+| `COUNT_UNROUTED` | `True` | Also count requests that never reach a view (404s, early-middleware responses) |
 | `MATCH_PATH_INFO` | `False` | Match paths against `request.path_info` instead of `request.path` |
 | `EXEMPT_PATHS` | `["/static/", "/media/"]` | Path prefixes never counted |
 | `EXEMPT_METHODS` | `["OPTIONS"]` | HTTP methods never counted |
@@ -267,7 +287,7 @@ TRAFFICWATCH = {"BLOCK_RESPONSE": "myproject.views.too_many", ...}
 | `TRUSTED_PROXIES` | `[]` | IPs / CIDR networks whose `X-Forwarded-For` is trusted |
 | `IPV6_PREFIX` | `64` | IPv6 clients are keyed on this prefix length (`128` = full address) |
 | `ON_EXCEEDED` | `None` | Dotted path or callable `(request, info)` |
-| `BACKEND` | `"fixed"` | `"fixed"`, `"sliding"`, `"redis"`, or dotted path to a `BaseBackend` subclass |
+| `BACKEND` | `"fixed"` | `"fixed"` (aligned windows, cheapest, up to 2x the limit across a window edge), `"sliding"` (two-bucket estimate, smooths the edge), `"redis"` (same estimate, one round trip), or dotted path to a `BaseBackend` subclass |
 | `CACHE_ALIAS` | `"default"` | Which `CACHES` entry to use |
 | `CACHE_PREFIX` | `"tw"` | Key namespace |
 | `FAIL_OPEN` | `True` | Allow requests (and mark `degraded`) when the cache raises; `False` blocks them |
@@ -288,7 +308,12 @@ TRAFFICWATCH = {"BLOCK_RESPONSE": "myproject.views.too_many", ...}
 - `EXEMPT_CLIENTS` is matched against the same resolved address, never against a raw header.
 - Counting happens before the view runs, so requests rejected by authentication still consume
   quota. That is what makes brute-force protection work.
-- `LocMemCache` is per process. Use Redis or Memcached in production (`manage.py check` warns).
+- `LocMemCache` is per process. Use Redis or Memcached in production (`manage.py check` warns
+  when `DEBUG` is off). `FileBasedCache` and `DatabaseCache` have a non-atomic `incr` and lose
+  counts under concurrency (`trafficwatch.W007`); `DummyCache` never limits anything (`E014`).
+- Deploy with `manage.py check --deploy --fail-level WARNING` so a misconfiguration stops the
+  rollout; the middleware itself refuses to start on invalid values (`MAX_REQUESTS=0`, a bad
+  dotted path, ...).
 
 ## Development
 
@@ -303,7 +328,7 @@ mypy --strict src
 ## Release
 
 1. Bump `__version__` in `src/django_trafficwatch/__init__.py` and update `CHANGELOG.md`.
-2. `git tag v0.3.0 && git push origin v0.3.0`
+2. `git tag v0.4.0 && git push origin v0.4.0`
 3. The `publish.yml` workflow runs tests, checks the tag matches the version, builds, and
    uploads to PyPI via Trusted Publishing.
 

@@ -54,8 +54,11 @@ drf.TrafficWatchThrottle ┘
 
 ## Request flow (middleware)
 
-1. `__call__` runs the rest of the stack, then decorates the outgoing response with headers.
-   Under ASGI `__acall__` does the same without leaving the event loop.
+1. `__call__` runs the rest of the stack. If `process_view` never ran (the URL did not
+   resolve, or a middleware below ours answered) and `COUNT_UNROUTED` is on, the request is
+   counted now against `PATH_RULES` / the global rule and the response is replaced by the
+   block response when the client is already over. Then the outgoing response gets the
+   headers. Under ASGI `__acall__` does the same (the late check runs via `sync_to_async`).
 2. `process_view` (runs after URL resolution, so the view function is known):
    1. Skip if `request.method` is in `EXEMPT_METHODS`, the match path (`request.path`, or
       `request.path_info` with `MATCH_PATH_INFO`) starts with an `EXEMPT_PATHS` prefix, the
@@ -66,10 +69,16 @@ drf.TrafficWatchThrottle ┘
       empty.
    3. If `LOCKOUT` is configured and the client is locked: an empty state with
       `lockout.active`; nothing is counted.
-   4. Otherwise `client = key_func(request)` per rule and one `backend.hit_many()` call (the
-      built-in backends loop over atomic `incr`s, the Redis backend runs one script).
-   5. If any rule was crossed for the first time (`count == limit + 1`) and `LOCKOUT` is
-      configured: one violation is counted; at the threshold the client is locked.
+   4. Otherwise `client = key_func(request)` per rule and one `backend.hit_many()` call with
+      an *enforce* flag per rule (per-rule `BLOCK`, else global). The backend increments
+      every rule, and if any enforced rule is exceeded it rolls all increments back: the
+      rejected request is not counted anywhere. The Redis backend does this in one script.
+      The returned `count` still includes the attempt, so a rejected request reads
+      `limit + 1`.
+   5. "Crossed for the first time" is an atomic `add` of a per-client/rule marker with the
+      window as TTL (`HitResult.first`), so the notification fires exactly once per window
+      however many rejections follow. If `LOCKOUT` is configured one violation is counted
+      per such request; at the threshold the client is locked.
    6. Store the `TrafficWatchState` on `request.trafficwatch`.
    7. For each crossed rule: log, record, signal, callback (info carries `lockout`).
    8. If any exceeded rule blocks (per-rule `BLOCK`, else global), the client is locked, or
@@ -78,8 +87,9 @@ drf.TrafficWatchThrottle ┘
       runs.
 
    Steps 3–5 run inside one `try`: any exception from the cache produces a *degraded* state
-   (no results, `degraded=True`), logged at most once per `FAIL_OPEN_LOG_INTERVAL`. Exceptions
-   from a `KEY_FUNC` are not caught; they are bugs in the host project.
+   (no results, `degraded=True`), logged at most once per `FAIL_OPEN_LOG_INTERVAL`. A raising
+   `KEY_FUNC` is logged the same way and the request is keyed on the client IP; a raising
+   `EXEMPT_FUNC` is logged and exempts nothing. Neither turns into a 500.
 
 `process_view` stays synchronous because Django's cache API is synchronous; Django wraps it
 with `sync_to_async` in an async stack. The response pass is native in both modes.
@@ -113,7 +123,9 @@ custom `KEY_FUNC`s cannot produce keys Memcached rejects.
 
 ```
 {PREFIX}:{fw|sw}:{rule_name}:{client}:{bucket}    fixed / sliding counters (Django cache keys)
+{PREFIX}:x:{rule_name}:{client}                   first-crossing marker, TTL = window
 {PREFIX}:rl:{{client}}:{rule_name}:{bucket}        redis backend (raw keys, hash-tagged by client)
+{PREFIX}:rl:{{client}}:{rule_name}:x               redis backend first-crossing marker
 {PREFIX}:viol:{client}:{bucket}                   lockout violation counter (fixed window)
 {PREFIX}:lock:{client}                            active lockout, value = expiry timestamp
 {PREFIX}:recent                                   list of recent violation dicts
@@ -148,9 +160,12 @@ so a flapping cache cannot break a request that was counted successfully.
 `RedisLuaBackend` obtains the redis-py client behind Django's `RedisCache`
 (`cache._cache.get_client(None, write=True)`) or `django-redis` (`cache.client.get_client`).
 `hit_many` groups the specs by client and runs one `EVALSHA` per client: the script `INCR`s
-each current bucket (setting the TTL on creation) and `GET`s each previous bucket, returning
-all counts. Python then applies `two_bucket_result()`, the exact function the sliding backend
-uses, so semantics, tests and `Retry-After` are identical. Keys are hash-tagged with the client
+each current bucket (setting the TTL on creation), `GET`s each previous bucket, computes the
+estimate with the same `weight = 1 - elapsed` double Python uses (passed as `repr`, so both
+sides floor the identical number), rolls every increment back when an enforced rule is
+over, and `SET NX EX`s the first-crossing marker. Python then applies `two_bucket_result()`,
+the exact function the sliding backend uses, so semantics, tests and `Retry-After` are
+identical. Keys are hash-tagged with the client
 so Redis Cluster accepts the multi-key script. Lockout and the recent list keep using the
 Django cache API. When the cache is not Redis the constructor logs once and delegates
 everything to a `SlidingWindowBackend`.
@@ -164,18 +179,26 @@ as `"name";r=remaining;t=seconds` for the strictest rule (or `"lockout";r=0;t=�
 per draft-ietf-httpapi-ratelimit-headers; names are quoted as RFC 8941 strings. `"both"`
 emits all of them.
 
-## Sliding window and `Retry-After`
+## Admission, rollback and `Retry-After`
+
+Only accepted requests stay counted. Every built-in backend does `incr` on each rule, decides
+admission from the new values, and `decr`s them all when an enforced rule is over. With
+atomic `incr`/`decr` this admits exactly `limit` requests per window under concurrency (two
+racing requests both see the over-limit value and both roll back). Counting rejected requests
+instead, as 0.3 did, made the sliding estimate self-reinforcing: a client at 1.1× the limit
+pushed its own estimate up with each retry and got almost nothing through.
 
 ```
 estimate = previous_bucket * (1 - elapsed_fraction) + current_bucket
 ```
 
 When `estimate >= limit`, `reset_in` is the smallest `t` such that a request at `now + t`
-would be accepted: either the point inside the current bucket where the previous bucket has
-decayed enough, or (if the current bucket alone is already full) the roll-over plus the decay
-time of the current bucket. The integer flooring of the estimate is ignored in that solve,
-which can only make the wait longer by under a second. Tests assert that a request issued
-exactly `reset_in` seconds later is accepted.
+would be accepted given the *stored* (accepted) counts: either the point inside the current
+bucket where the previous bucket has decayed enough, or (if the current bucket alone is
+already full) the roll-over plus the decay time of the current bucket. The integer flooring
+of the estimate is ignored in that solve, which can only make the wait longer by under a
+second. All `reset_in` values are rounded up (`ceil`) and never 0, so a client that waits
+exactly `Retry-After` is served. Tests assert that for both backends.
 
 ## Backend contract
 
@@ -199,7 +222,15 @@ need `hit`/`reset` and a dotted path in `TRAFFICWATCH["BACKEND"]`.
 - Fixed window permits up to 2× `limit` across a bucket boundary; sliding reduces that to
   roughly 1×–1.3× depending on traffic shape, at the cost of one extra cache `get`.
 - `_incr` is `add` + `incr`; if the key expires between the two the count restarts at 1.
-  This can only under-count by one request at a window edge.
+  This can only under-count by one request at a window edge. The rollback `decr` of a
+  rejected request costs one extra cache round trip per rule on rejections only.
+- Not counting rejected requests means a hammering client is served exactly `limit` per
+  window instead of (as in 0.3) locking itself out further. Operators who want escalation
+  use `LOCKOUT`.
+- A third-party backend that only implements `hit()` keeps "count everything" semantics;
+  the default `hit_many` cannot roll back what it does not know about.
+- Caches whose `incr` is a non-atomic get/set (`FileBasedCache`, `DatabaseCache`) lose counts
+  under concurrency; `manage.py check` warns (`W007`).
 - The recent-violations list is a non-atomic read-modify-write; under a flood of simultaneous
   first-crossings an entry may be lost. It is a diagnostic aid; the signal is the audit path.
 - `LocMemCache` is per-process; production should use Redis/Memcached.

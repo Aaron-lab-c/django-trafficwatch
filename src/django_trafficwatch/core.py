@@ -20,7 +20,7 @@ from django.http import HttpResponse, JsonResponse
 from . import stats
 from .backends.base import BaseBackend, HitResult
 from .conf import tw_settings
-from .keys import is_exempt_client, safe_key_part
+from .keys import client_ip, is_exempt_client, safe_key_part
 from .rules import Rule
 from .signals import traffic_exceeded
 
@@ -30,7 +30,36 @@ REQUEST_ATTR = "trafficwatch"
 LOCKOUT_RULE_NAME = "lockout"
 
 _outage_lock = threading.Lock()
-_outage_logged_at = 0.0
+_outage_logged_at: dict[str, float] = {}
+
+
+def _log_throttled(kind: str, message: str, *args: Any) -> None:
+    """Log ``message`` at ERROR with the traceback at most once per
+    FAIL_OPEN_LOG_INTERVAL seconds per ``kind`` (cache outage, broken KEY_FUNC, ...)."""
+    now = time.time()
+    interval = float(tw_settings.FAIL_OPEN_LOG_INTERVAL or 0)
+    with _outage_lock:
+        should_log = now - _outage_logged_at.get(kind, 0.0) >= interval
+        if should_log:
+            _outage_logged_at[kind] = now
+    if should_log:
+        logger.error(message, *args, exc_info=True)
+
+
+def _reset_log_throttle() -> None:  # for tests
+    _outage_logged_at.clear()
+
+
+def client_for(request: Any, key_func: Any) -> str:
+    """Run a KEY_FUNC. A raising key func is logged (throttled) and the request falls back
+    to the client IP so it is still limited instead of failing with a 500."""
+    try:
+        return str(key_func(request))
+    except Exception:
+        _log_throttled(
+            "key_func", "TRAFFICWATCH KEY_FUNC %r raised; keying on the client IP.", key_func
+        )
+        return f"ip:{client_ip(request)}"
 
 
 def _sf_string(value: str) -> str:
@@ -70,6 +99,11 @@ class LockoutState:
         }
 
 
+def rule_enforces(rule: Rule) -> bool:
+    """Per-rule BLOCK beats the global one."""
+    return bool(rule.block if rule.block is not None else tw_settings.BLOCK)
+
+
 @dataclass(frozen=True)
 class RuleResult:
     rule: Rule
@@ -79,8 +113,7 @@ class RuleResult:
     @property
     def blocks(self) -> bool:
         """Exceeded *and* configured to block (per-rule BLOCK beats the global one)."""
-        block = self.rule.block if self.rule.block is not None else tw_settings.BLOCK
-        return bool(block and self.result.exceeded)
+        return rule_enforces(self.rule) and self.result.exceeded
 
     def info(
         self, request: Any, *, lockout: LockoutState | None = None, degraded: bool = False
@@ -162,10 +195,7 @@ class TrafficWatchState:
             strictest = max(blocking, key=lambda r: r.result.reset_in)
             info = strictest.info(request, lockout=self.lockout, degraded=self.degraded)
         else:
-            try:
-                client = tw_settings.KEY_FUNC(request)
-            except Exception:  # never let a broken key func hide the block
-                client = "unknown"
+            client = client_for(request, tw_settings.KEY_FUNC)
             info = {
                 "client": client,
                 "path": request.path,
@@ -221,7 +251,13 @@ def is_exempt_request(request: Any) -> bool:
     if is_exempt_client(request):
         return True
     func = tw_settings.EXEMPT_FUNC
-    return bool(func is not None and func(request))
+    if func is None:
+        return False
+    try:
+        return bool(func(request))
+    except Exception:  # a broken exemption hook must not 500 the site: count the request
+        _log_throttled("exempt_func", "TRAFFICWATCH EXEMPT_FUNC %r raised; not exempting.", func)
+        return False
 
 
 class TrafficWatch:
@@ -237,8 +273,8 @@ class TrafficWatch:
         just crossed and return the combined state. Does not build a response."""
         default_key_func = tw_settings.KEY_FUNC
         lockout_cfg = tw_settings.lockout
-        clients = [(rule.key_func or default_key_func)(request) for rule in rules]
-        lock_client = safe_key_part(default_key_func(request)) if lockout_cfg else None
+        clients = [client_for(request, rule.key_func or default_key_func) for rule in rules]
+        lock_client = safe_key_part(client_for(request, default_key_func)) if lockout_cfg else None
 
         try:
             if lockout_cfg is not None and lock_client is not None:
@@ -255,7 +291,13 @@ class TrafficWatch:
 
             hits = self.backend.hit_many(
                 [
-                    (safe_key_part(client), safe_key_part(rule.name), rule.window, rule.limit)
+                    (
+                        safe_key_part(client),
+                        safe_key_part(rule.name),
+                        rule.window,
+                        rule.limit,
+                        rule_enforces(rule),
+                    )
                     for client, rule in zip(clients, rules)
                 ]
             )
@@ -290,7 +332,7 @@ class TrafficWatch:
         """Read-only view of the counters (no request is counted). None if the backend
         cannot answer."""
         default_key_func = tw_settings.KEY_FUNC
-        clients = [(rule.key_func or default_key_func)(request) for rule in rules]
+        clients = [client_for(request, rule.key_func or default_key_func) for rule in rules]
         try:
             hits = self.backend.peek_many(
                 [
@@ -311,21 +353,12 @@ class TrafficWatch:
 
     def _degraded(self, rules: tuple[Rule, ...]) -> TrafficWatchState:
         """The cache raised: log (rate limited) and return an empty, degraded state."""
-        global _outage_logged_at
-        now = time.time()
-        interval = float(tw_settings.FAIL_OPEN_LOG_INTERVAL or 0)
-        with _outage_lock:
-            should_log = now - _outage_logged_at >= interval
-            if should_log:
-                _outage_logged_at = now
-        if should_log:
-            logger.error(
-                "TrafficWatch cache backend unavailable; %s requests until it recovers "
-                "(FAIL_OPEN=%s).",
-                "allowing" if tw_settings.FAIL_OPEN else "blocking",
-                tw_settings.FAIL_OPEN,
-                exc_info=True,
-            )
+        _log_throttled(
+            "cache",
+            "TrafficWatch cache backend unavailable; %s requests until it recovers (FAIL_OPEN=%s).",
+            "allowing" if tw_settings.FAIL_OPEN else "blocking",
+            tw_settings.FAIL_OPEN,
+        )
         retry = min((rule.window for rule in rules), default=60)
         return TrafficWatchState(results=(), degraded=True, fallback_retry_after=retry)
 

@@ -3,7 +3,10 @@
     process_view        -> skip EXEMPT_* / @trafficwatch_exempt,
                            resolve rules (view decorators > PATH_RULES > global),
                            count against every rule (one batch), maybe block
-    __call__ (after)    -> attach rate-limit headers to whatever response came back
+    __call__ (after)    -> if no view ran (404 from the resolver, a response short-circuited
+                           by an earlier middleware) count the request against PATH_RULES /
+                           the global rule now (COUNT_UNROUTED) and maybe replace the
+                           response; attach rate-limit headers to whatever goes out
 
 The middleware is both sync- and async-capable: under ASGI the response pass runs natively
 in the event loop. ``process_view`` itself stays synchronous (cache backends are sync) and
@@ -15,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from asgiref.sync import iscoroutinefunction, markcoroutinefunction
+from asgiref.sync import iscoroutinefunction, markcoroutinefunction, sync_to_async
 from django.http import HttpRequest, HttpResponse
 
 from .conf import tw_settings
@@ -42,10 +45,14 @@ class TrafficWatchMiddleware:
         if self._is_async:
             return self.__acall__(request)
         response: HttpResponse = self.get_response(request)
+        if not hasattr(request, REQUEST_ATTR):
+            response = self._late_check(request) or response
         return apply_headers(response, getattr(request, REQUEST_ATTR, None))
 
     async def __acall__(self, request: HttpRequest) -> HttpResponse:
         response: HttpResponse = await self.get_response(request)
+        if not hasattr(request, REQUEST_ATTR):
+            response = await sync_to_async(self._late_check)(request) or response
         return apply_headers(response, getattr(request, REQUEST_ATTR, None))
 
     def process_view(
@@ -71,6 +78,22 @@ class TrafficWatchMiddleware:
 
         if state.blocked:
             return apply_headers(self.watch.block_response(request, state), state)
+        return None
+
+    def _late_check(self, request: HttpRequest) -> HttpResponse | None:
+        """``process_view`` never ran: the URL did not resolve (404) or an earlier
+        middleware answered the request itself. Count it against PATH_RULES / the global
+        rule so scanners probing unknown URLs are limited too; return a block response
+        when the client is already over."""
+        if not tw_settings.COUNT_UNROUTED or self._is_exempt(request):
+            setattr(request, REQUEST_ATTR, None)
+            return None
+        method = request.method or "GET"
+        rules = tw_settings.rules_for(tw_settings.match_path(request), method)
+        state = self.watch.check(request, rules)
+        setattr(request, REQUEST_ATTR, state)
+        if state.blocked:
+            return self.watch.block_response(request, state)
         return None
 
     # -- helpers -----------------------------------------------------------
