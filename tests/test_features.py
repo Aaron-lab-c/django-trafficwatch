@@ -12,6 +12,8 @@ from django.utils.translation import gettext_lazy
 
 from django_trafficwatch import core, traffic_exceeded
 from django_trafficwatch.backends.fixed_window import FixedWindowBackend
+from django_trafficwatch.conf import tw_settings
+from django_trafficwatch.core import TrafficWatch
 from tests.conftest import fresh_client
 
 # -- fail-open -----------------------------------------------------------------------
@@ -192,6 +194,36 @@ def test_blocked_request_does_not_consume_other_rules(client, frozen):
     assert r.status_code == 200
     assert client.get("/decorated/stacked/").status_code == 429  # hourly (3) now exhausted
     assert client.get("/decorated/stacked/")["X-RateLimit-Limit"] == "3"
+
+
+def test_rejected_requests_do_not_consume_the_daily_quota(client, tw, frozen):
+    """11 requests/minute against 10/min + 50/day for five minutes: 50 are served, 5 are
+    rejected by the minute rule, and the daily counter holds 50, not 55."""
+    tw(
+        PATH_RULES={
+            "/api/login/": [
+                {"WINDOW_SECONDS": 60, "MAX_REQUESTS": 10, "NAME": "login-minute"},
+                {"WINDOW_SECONDS": 86400, "MAX_REQUESTS": 50, "NAME": "login-daily"},
+            ]
+        }
+    )
+    served = rejected = 0
+    for minute in range(5):
+        for i in range(11):
+            frozen["t"] = 1000.0 + minute * 60 + i * 5
+            r = client.get("/api/login/")
+            if r.status_code == 200:
+                served += 1
+            else:
+                rejected += 1
+                if minute < 4:  # in the last minute the daily quota is exhausted as well
+                    assert r["X-RateLimit-Limit"] == "10"  # the minute rule did it
+    assert (served, rejected) == (50, 5)
+    rules = tw_settings.rules_for("/api/login/")
+    state = TrafficWatch().peek(RequestFactory().get("/api/login/", REMOTE_ADDR="1.1.1.1"), rules)
+    counts = {rr.rule.name: rr.result.count for rr in state.results}
+    assert counts["login-daily"] == 50  # not 55: the 5 rejected requests left no trace
+    assert counts["login-minute"] <= 10
 
 
 def test_retrying_client_gets_served_after_retry_after(client, frozen):

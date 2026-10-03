@@ -7,7 +7,7 @@ Configurable traffic monitoring and rate limiting for Django, as a single middle
 Set a time window and a request count, globally, per path, per method, or per view.
 Observe first, block later.
 
-- Fixed-window and sliding-window counters on top of Django's cache framework (Redis, Memcached, LocMem)
+- Fixed-window counters (default) on top of Django's cache framework (Redis, Memcached, LocMem); sliding-window and single-round-trip Redis variants when the burst at window edges matters
 - Rules per path prefix or regex, per HTTP method, several limits on one endpoint (5/min **and** 100/day)
 - `@trafficwatch_rule` / `@trafficwatch_exempt` for function and class-based views, stackable
 - Observe-only mode (`BLOCK=False`), globally or per rule, to measure before enforcing
@@ -60,7 +60,7 @@ TRAFFICWATCH = {
     "EXEMPT_FUNC": lambda request: request.user.is_superuser,
     "TRUSTED_PROXIES": ["10.0.0.0/8"],  # only then is X-Forwarded-For honoured
     "BLOCK": False,  # start in observe-only mode, flip to True when happy
-    "BACKEND": "sliding",  # "fixed" (default), "sliding" or "redis"
+    "BACKEND": "fixed",  # default; "sliding" / "redis" smooth the burst at window edges
     "LOCKOUT": {"VIOLATIONS": 3, "WINDOW_SECONDS": 600, "DURATION_SECONDS": 900},
     "ON_EXCEEDED": "myproject.alerts.notify",
 }
@@ -287,7 +287,7 @@ TRAFFICWATCH = {"BLOCK_RESPONSE": "myproject.views.too_many", ...}
 | `TRUSTED_PROXIES` | `[]` | IPs / CIDR networks whose `X-Forwarded-For` is trusted |
 | `IPV6_PREFIX` | `64` | IPv6 clients are keyed on this prefix length (`128` = full address) |
 | `ON_EXCEEDED` | `None` | Dotted path or callable `(request, info)` |
-| `BACKEND` | `"fixed"` | `"fixed"`, `"sliding"`, `"redis"`, or dotted path to a `BaseBackend` subclass |
+| `BACKEND` | `"fixed"` | `"fixed"` (aligned windows, cheapest, up to 2x the limit across a window edge), `"sliding"` (two-bucket estimate, smooths the edge), `"redis"` (same estimate, one round trip), or dotted path to a `BaseBackend` subclass |
 | `CACHE_ALIAS` | `"default"` | Which `CACHES` entry to use |
 | `CACHE_PREFIX` | `"tw"` | Key namespace |
 | `FAIL_OPEN` | `True` | Allow requests (and mark `degraded`) when the cache raises; `False` blocks them |
