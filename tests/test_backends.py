@@ -104,3 +104,76 @@ def test_sliding_reset_in_under_limit_is_window_remainder(frozen):
     b = SlidingWindowBackend("default", "t")
     frozen["t"] = 1003.0
     assert b.hit("c", "*", 10, 100).reset_in == 7
+
+
+# -- batch API / lockout helpers (shared by every backend) -------------------------
+
+
+@pytest.mark.parametrize("backend_cls", [FixedWindowBackend, SlidingWindowBackend])
+def test_hit_many_and_peek_many(frozen, backend_cls):
+    b = backend_cls("default", "t")
+    specs = [("c", "a", 10, 2), ("c", "b", 10, 5)]
+    for _ in range(3):
+        results = b.hit_many(specs)
+    assert [r.count for r in results] == [3, 3]
+    assert results[0].exceeded and not results[1].exceeded
+    assert [p.count for p in b.peek_many(specs)] == [3, 3]
+    assert b.hit_many([]) == [] and b.peek_many([]) == []
+
+
+def test_lockout_helpers(frozen):
+    b = FixedWindowBackend("default", "t")
+    assert b.locked_until("c") is None
+    assert [b.count_violation("c", 600) for _ in range(3)] == [1, 2, 3]
+    assert b.count_violation("other", 600) == 1
+    until = b.lock("c", 900)
+    assert until == 1900.0 and b.locked_until("c") == 1900.0
+    frozen["t"] = 1899.0
+    assert b.locked_until("c") == 1900.0
+    frozen["t"] = 1900.0
+    assert b.locked_until("c") is None
+    frozen["t"] = 1000.0
+    b.unlock("c")
+    assert b.locked_until("c") is None
+    frozen["t"] = 1601.0  # violation window rolled over
+    assert b.count_violation("c", 600) == 1
+
+
+# -- redis_lua fallback -----------------------------------------------------------
+
+
+def test_redis_lua_backend_falls_back_on_non_redis_cache(frozen, caplog, settings):
+    from django_trafficwatch.backends.redis_lua import RedisLuaBackend
+
+    if "redis" in settings.CACHES["default"]["BACKEND"].lower():
+        pytest.skip("suite is running against Redis")
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="django_trafficwatch"):
+        b = RedisLuaBackend("default", "t")
+    assert not b.is_native and isinstance(b.fallback, SlidingWindowBackend)
+    assert "falling back" in caplog.text
+    for _ in range(3):
+        last = b.hit("c", "*", 10, 2)
+    assert last.count == 3 and last.exceeded
+    assert b.peek("c", "*", 10, 2).count == 3
+    assert [r.count for r in b.hit_many([("c", "*", 10, 2), ("c", "x", 10, 2)])] == [4, 1]
+    b.reset("c", "*", 10)
+    assert b.hit("c", "*", 10, 2).count == 1
+
+
+def test_raw_redis_client_detection():
+    from django.core.cache import caches
+
+    from django_trafficwatch.backends.redis_lua import raw_redis_client
+
+    class FakeDjangoRedis:
+        class client:  # noqa: N801
+            @staticmethod
+            def get_client(write=False):
+                return ("django-redis", write)
+
+    assert raw_redis_client(FakeDjangoRedis()) == ("django-redis", True)
+    assert raw_redis_client(object()) is None
+    if "locmem" in type(caches["default"]).__name__.lower():
+        assert raw_redis_client(caches["default"]) is None

@@ -30,7 +30,13 @@ def test_observe_only_mode(client, tw):
     for _ in range(5):
         r = client.get("/state/")
         assert r.status_code == 200
-    assert r.json() == {"exceeded": True, "blocked": False, "rules": ["*"], "counts": [5]}
+    assert r.json() == {
+        "exceeded": True,
+        "blocked": False,
+        "degraded": False,
+        "rules": ["*"],
+        "counts": [5],
+    }
 
 
 def test_custom_status_and_message(client, tw):
@@ -271,4 +277,10 @@ async def test_async_stack():
 
 def test_request_state_is_exposed(client):
     r = client.get("/state/")
-    assert r.json() == {"exceeded": False, "blocked": False, "rules": ["*"], "counts": [1]}
+    assert r.json() == {
+        "exceeded": False,
+        "blocked": False,
+        "degraded": False,
+        "rules": ["*"],
+        "counts": [1],
+    }

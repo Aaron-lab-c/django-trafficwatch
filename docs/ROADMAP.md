@@ -1,54 +1,42 @@
 # Roadmap
 
-Prioritised backlog after the 0.2.0 refactor. Each item should land with tests, a CHANGELOG
-entry and README/ARCHITECTURE updates. Run the suite with `pytest`, lint with
-`ruff check . && ruff format --check src tests`.
+Prioritised backlog. Each item should land with tests, a CHANGELOG entry and
+README/ARCHITECTURE updates. Run the suite with `pytest` (and
+`TW_REDIS_URL=redis://localhost:6379/1 pytest` for the Redis path), lint with
+`ruff check . && ruff format --check src tests`, type-check with `mypy --strict src`.
 
-## P1 — production safety
+## Done in 0.3.0
 
-1. **Fail-open on cache outage.** `cache.add/incr/get` raising (Redis down) currently turns
-   every request into a 500. Add `FAIL_OPEN` (default `True`): catch backend exceptions in
-   `core.TrafficWatch.check`, log once per N seconds, allow the request and mark the state as
-   `degraded`; with `FAIL_OPEN=False` return the block response. Expose `degraded` on
-   `TrafficWatchState` and in a system-check hint.
-2. **IPv6 /64 keying.** Add `IPV6_PREFIX` (default `64`) in `keys.client_ip`; a client that
-   rotates addresses inside its /64 must share one counter. Keep IPv4 untouched.
-3. **Allow-list and conditional exemption.** `EXEMPT_CLIENTS` (IPs / CIDR, matched against the
-   resolved client IP) and `EXEMPT_FUNC` (dotted path or callable `(request) -> bool`, e.g.
-   superusers). Both validated by `checks.py`.
-4. **Fail fast on bad configuration.** Build `tw_settings.ruleset` and import all
-   `_IMPORTABLE` callables in `TrafficWatchMiddleware.__init__` so a typo fails at process
-   start instead of on the first request.
+- P1.1 Fail-open on cache outage (`FAIL_OPEN`, `FAIL_OPEN_LOG_INTERVAL`, `state.degraded`, W005).
+- P1.2 IPv6 /64 keying (`IPV6_PREFIX`).
+- P1.3 Allow-list and conditional exemption (`EXEMPT_CLIENTS`, `EXEMPT_FUNC`, E009).
+- P1.4 Fail fast on bad configuration (`tw_settings.validate()` in the middleware constructor).
+- P2.5 Escalating lockout (`LOCKOUT`, `info["lockout"]`, `Retry-After`, `trafficwatch_recent`).
+- P2.6 Redis integration tests in CI (`test-redis` job, threaded `incr` atomicity test).
+- P2.7 Single round-trip Redis backend (`BACKEND="redis"`, `backends/redis_lua.py`, W006).
+- P2.8 Standard rate-limit headers (`HEADERS_STYLE`, `RESET_AS_EPOCH`).
+- P3.9 Staff-only `recent/` + `recent.json` views; Prometheus example in the README.
+- P3.10 `BLOCK_MESSAGE` with `gettext_lazy`.
+- P3.11 `method_decorator(trafficwatch_rule(...), name="post")` on CBVs is now supported
+  (class, `dispatch` and the request-method handler are all inspected).
+- P3.12 `MATCH_PATH_INFO`.
+- P3.13 `py.typed` shipped, `mypy --strict src` in CI.
 
-## P2 — capability gaps
+## Open
 
-5. **Escalating lockout.** `LOCKOUT = {"VIOLATIONS": 3, "WINDOW_SECONDS": 600,
-   "DURATION_SECONDS": 900}`: after N first-crossings within the window, block the client for
-   the duration regardless of rule. Implement with an extra counter + a `locked` key via the
-   existing backend; surface in headers (`Retry-After`), `info["lockout"]`, signal and
-   `trafficwatch_recent`.
-6. **Redis integration tests in CI.** Add a job with a `redis` service, settings using
-   `django.core.cache.backends.redis.RedisCache`, run the whole suite against it, plus a
-   threaded test proving `incr` atomicity.
-7. **Single round-trip Redis backend.** `backends/redis_lua.py`: one Lua script evaluating all
-   rules for a client (exact sliding log with a sorted set or the two-bucket estimate),
-   selected via `BACKEND="redis"`. Must degrade gracefully when the cache is not Redis.
-8. **Standard rate-limit headers.** `HEADERS_STYLE = "x-ratelimit" | "ietf" | "both"`; `ietf`
-   emits `RateLimit-Policy` / `RateLimit` per draft-ietf-httpapi-ratelimit-headers. Option
-   `RESET_AS_EPOCH` for `X-RateLimit-Reset`.
-
-## P3 — polish
-
-9. Admin integration: a read-only admin view (and/or `trafficwatch/recent.json` endpoint,
-   staff-only) listing recent violations; optional Prometheus counter example via the signal.
-10. `BLOCK_MESSAGE` with `gettext_lazy`: wrap in `str()` before `JsonResponse`.
-11. Document (or detect and warn) that `method_decorator(trafficwatch_rule(...), name="post")`
-    on a CBV method is invisible to the middleware; decorate the class instead.
-12. `MATCH_PATH_INFO` option so `PATH_RULES` match `request.path_info` under `SCRIPT_NAME`
-    deployments.
-13. Ship `py.typed` and run `mypy --strict` on `src` in CI.
-14. (Low value) native async `process_view` using the cache `a*` API; Django's cache backends
-    are sync underneath, so measure before merging.
+1. **Exact sliding log for Redis.** An optional `"redis-log"` mode using a sorted set per
+   client/rule, for deployments that need exact counts and accept the memory profile (one
+   member per request in the window). Must not count rejected requests, and must still fire
+   the first-crossing notification exactly once.
+2. **Admin site integration.** Register the inspection view on `admin.site` (link in the admin
+   index) instead of a standalone URL include; needs `django.contrib.admin` detection so the
+   package keeps working without it.
+3. **Lockout notifications.** A dedicated `lockout_started` signal (today the lock rides on the
+   crossing's `traffic_exceeded` payload as `info["lockout"]`).
+4. **Per-rule lockout identity.** Allow `LOCKOUT["KEY_FUNC"]` for projects whose rules key on
+   API keys rather than users / IPs.
+5. (Low value) native async `process_view` using the cache `a*` API; Django's cache backends
+   are sync underneath, so measure before merging.
 
 ## Non-goals for now
 

@@ -1,3 +1,4 @@
+import contextlib
 from unittest import mock
 
 import pytest
@@ -22,14 +23,24 @@ def tw(settings):
     return _set
 
 
+FROZEN_MODULES = (
+    "django_trafficwatch.backends.base.time",
+    "django_trafficwatch.backends.fixed_window.time",
+    "django_trafficwatch.backends.sliding_window.time",
+    "django_trafficwatch.backends.redis_lua.time",
+    "django_trafficwatch.core.time",
+)
+
+
 @pytest.fixture
 def frozen():
-    """Freeze ``time.time()`` for both backends; mutate ``frozen["t"]`` to advance."""
-    with mock.patch("django_trafficwatch.backends.fixed_window.time") as ft:
-        with mock.patch("django_trafficwatch.backends.sliding_window.time") as st:
-            now = {"t": 1000.0}
-            ft.time.side_effect = st.time.side_effect = lambda: now["t"]
-            yield now
+    """Freeze ``time.time()`` for the backends and core; mutate ``frozen["t"]`` to advance."""
+    now = {"t": 1000.0}
+    with contextlib.ExitStack() as stack:
+        for target in FROZEN_MODULES:
+            patched = stack.enter_context(mock.patch(target))
+            patched.time.side_effect = lambda: now["t"]
+        yield now
 
 
 @pytest.fixture

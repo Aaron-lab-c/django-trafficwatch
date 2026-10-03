@@ -11,12 +11,16 @@ Observe first, block later.
 - Rules per path prefix or regex, per HTTP method, several limits on one endpoint (5/min **and** 100/day)
 - `@trafficwatch_rule` / `@trafficwatch_exempt` for function and class-based views, stackable
 - Observe-only mode (`BLOCK=False`), globally or per rule, to measure before enforcing
-- `X-RateLimit-Limit / Remaining / Reset` and an honest `Retry-After`
-- `traffic_exceeded` signal, `ON_EXCEEDED` hook and structured log records for Slack / Sentry / JSON logs
-- `X-Forwarded-For` only trusted behind proxies you list: clients cannot forge their identity
+- `X-RateLimit-Limit / Remaining / Reset`, the IETF `RateLimit` / `RateLimit-Policy` headers, and an honest `Retry-After`
+- Escalating lockout: a client that trips limits repeatedly is locked out for a configurable time
+- Fails open: a cache outage is logged and lets traffic through (`request.trafficwatch.degraded`), it never turns into a wall of 500s
+- `traffic_exceeded` signal, `ON_EXCEEDED` hook and structured log records for Slack / Sentry / JSON logs / Prometheus
+- `X-Forwarded-For` only trusted behind proxies you list: clients cannot forge their identity; IPv6 keyed per /64
+- Allow-list by IP / CIDR or by callable (superusers, internal traffic)
 - Django REST Framework throttle class sharing the same rules and counters
-- `manage.py check` validates your configuration, `manage.py trafficwatch_recent` shows who got blocked
-- Sync and async (ASGI) capable, no models, no migrations
+- Optional single-round-trip Redis backend (one Lua script per request, however many rules apply)
+- `manage.py check` validates your configuration and the middleware refuses to start on a bad one; `manage.py trafficwatch_recent` and a staff-only page show who got blocked
+- Sync and async (ASGI) capable, no models, no migrations, fully typed (`py.typed`)
 
 ## Install
 
@@ -52,15 +56,20 @@ TRAFFICWATCH = {
         r"re:^/api/v\d+/search/": {"MAX_REQUESTS": 30},
     },
     "EXEMPT_PATHS": ["/static/", "/media/", "/health/"],
+    "EXEMPT_CLIENTS": ["10.0.0.0/8"],  # monitoring, internal callers
+    "EXEMPT_FUNC": lambda request: request.user.is_superuser,
     "TRUSTED_PROXIES": ["10.0.0.0/8"],  # only then is X-Forwarded-For honoured
     "BLOCK": False,  # start in observe-only mode, flip to True when happy
-    "BACKEND": "sliding",  # or "fixed" (default)
+    "BACKEND": "sliding",  # "fixed" (default), "sliding" or "redis"
+    "LOCKOUT": {"VIOLATIONS": 3, "WINDOW_SECONDS": 600, "DURATION_SECONDS": 900},
     "ON_EXCEEDED": "myproject.alerts.notify",
 }
 ```
 
 Run `python manage.py check` to validate the configuration (typos in keys, bad regexes,
-unimportable callables, middleware ordering, LocMem in production, ...).
+unimportable callables, middleware ordering, LocMem in production, ...). The middleware also
+validates everything when it is instantiated, so a typo raises `ImproperlyConfigured` at
+process start rather than on the first request.
 
 ## Per-view control
 
@@ -80,6 +89,15 @@ class SearchView(View): ...
 
 `@trafficwatch_rule` also accepts `name=`, `block=` (per-rule observe mode) and `key_func=`.
 
+On class-based views you can also decorate a single handler, which limits that method only:
+
+```python
+@method_decorator(trafficwatch_rule(60, 5), name="post")
+class LoginView(View): ...
+```
+
+(The middleware looks at the class, `dispatch` and the handler for the request method.)
+
 ## Rule resolution
 
 1. `@trafficwatch_rule` decorators on the view (filtered by `methods`).
@@ -89,6 +107,39 @@ class SearchView(View): ...
 
 Every applicable rule is counted independently; the response headers describe the rule closest
 to its limit and `Retry-After` is the longest wait among the rules that blocked.
+
+Rules are matched against `request.path`. Set `MATCH_PATH_INFO = True` to match
+`request.path_info` instead when the project is mounted under a `SCRIPT_NAME` prefix.
+
+## Exemptions
+
+Never counted: `EXEMPT_METHODS` (default `OPTIONS`), `EXEMPT_PATHS` prefixes,
+`EXEMPT_CLIENTS` (IPs / CIDR networks, matched against the *resolved* client IP so a client
+cannot forge its way in with `X-Forwarded-For`), requests for which `EXEMPT_FUNC(request)`
+returns true, and views marked `@trafficwatch_exempt`.
+
+## Escalating lockout
+
+```python
+TRAFFICWATCH = {"LOCKOUT": {"VIOLATIONS": 3, "WINDOW_SECONDS": 600, "DURATION_SECONDS": 900}}
+```
+
+Every time a client crosses *any* limit for the first time in a window it earns a violation.
+After `VIOLATIONS` of them within `WINDOW_SECONDS` the client is blocked for
+`DURATION_SECONDS` regardless of rule, with `Retry-After` set to the remaining lock time and
+nothing counted in the meantime. The crossing that triggered the lock carries
+`info["lockout"]` (`violations`, `threshold`, `locked_until`, `active`) into the signal,
+`ON_EXCEEDED`, the log record and `trafficwatch_recent`. Clients are identified with the
+global `KEY_FUNC`.
+
+## When the cache is down
+
+With the default `FAIL_OPEN = True` a cache exception (Redis unreachable, Memcached restart)
+is logged at `ERROR` on the `django_trafficwatch` logger at most once per
+`FAIL_OPEN_LOG_INTERVAL` seconds, the request is allowed and `request.trafficwatch.degraded`
+is `True` (no rate-limit headers are emitted). With `FAIL_OPEN = False` every request gets
+the block response until the cache recovers; `manage.py check` warns about that
+(`trafficwatch.W005`).
 
 ## Alerts and observability
 
@@ -112,6 +163,19 @@ Both fire **once per client per window**, on the first request that crosses the 
 same event is logged at `WARNING` on the `django_trafficwatch` logger with the info dict attached
 as `record.trafficwatch`, so JSON log handlers get structured fields for free.
 
+A Prometheus counter is a three-line receiver:
+
+```python
+from prometheus_client import Counter
+from django_trafficwatch import traffic_exceeded
+
+EXCEEDED = Counter("trafficwatch_exceeded_total", "Rate limit crossings", ["rule", "blocked"])
+
+@receiver(traffic_exceeded)
+def count_exceeded(sender, info, **kwargs):
+    EXCEEDED.labels(rule=info["rule"], blocked=str(info["blocked"])).inc()
+```
+
 The last `RECENT_VIOLATIONS` events are kept in the cache:
 
 ```bash
@@ -120,8 +184,41 @@ python manage.py trafficwatch_recent --json -n 50
 python manage.py trafficwatch_recent --clear
 ```
 
+The same list is available to staff users over HTTP (403 for everyone else):
+
+```python
+urlpatterns = [path("trafficwatch/", include("django_trafficwatch.urls")), ...]
+# -> /trafficwatch/recent/  (read-only HTML table)   /trafficwatch/recent.json?limit=50
+```
+
 Inside a view or template, `request.trafficwatch` holds the evaluated state
-(`.exceeded`, `.blocked`, `.results`, `.headers()`); it is `None` for exempt requests.
+(`.exceeded`, `.blocked`, `.degraded`, `.lockout`, `.results`, `.headers()`); it is `None`
+for exempt requests.
+
+## Response headers
+
+`HEADERS_STYLE` selects the header family:
+
+| Style | Headers |
+|---|---|
+| `"x-ratelimit"` (default) | `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` (seconds, or a Unix timestamp with `RESET_AS_EPOCH = True`) |
+| `"ietf"` | `RateLimit-Policy: "login";q=5;w=60, "login-daily";q=50;w=86400` and `RateLimit: "login";r=2;t=37` per [draft-ietf-httpapi-ratelimit-headers](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/) |
+| `"both"` | all of the above |
+
+`Retry-After` is always added to block responses.
+
+## Redis backend
+
+```python
+CACHES = {"default": {"BACKEND": "django.core.cache.backends.redis.RedisCache", "LOCATION": "redis://..."}}
+TRAFFICWATCH = {"BACKEND": "redis", ...}
+```
+
+`"redis"` evaluates every rule for a client in **one** Lua script (one network round trip per
+request instead of two per rule) using the same two-bucket sliding estimate as `"sliding"`.
+It works with Django's built-in `RedisCache` and with `django-redis`, and is Redis Cluster
+safe (keys are hash-tagged by client). If `CACHE_ALIAS` is not a Redis cache it logs a warning
+and behaves exactly like `"sliding"` (`manage.py check` reports `trafficwatch.W006`).
 
 ## Django REST Framework
 
@@ -157,26 +254,38 @@ TRAFFICWATCH = {"BLOCK_RESPONSE": "myproject.views.too_many", ...}
 | `WINDOW_SECONDS` | `60` | Global window length |
 | `MAX_REQUESTS` | `100` | Global limit per window |
 | `PATH_RULES` | `{}` | `{prefix or "re:regex": rule or [rules]}`; rule keys `WINDOW_SECONDS`, `MAX_REQUESTS`, `METHODS`, `NAME`, `BLOCK`, `KEY_FUNC` |
+| `MATCH_PATH_INFO` | `False` | Match paths against `request.path_info` instead of `request.path` |
 | `EXEMPT_PATHS` | `["/static/", "/media/"]` | Path prefixes never counted |
 | `EXEMPT_METHODS` | `["OPTIONS"]` | HTTP methods never counted |
+| `EXEMPT_CLIENTS` | `[]` | IPs / CIDR networks never counted (resolved client IP) |
+| `EXEMPT_FUNC` | `None` | Dotted path or callable `(request) -> bool`; true = never counted |
 | `BLOCK` | `True` | `False` = log/alert only (per-rule `BLOCK` overrides) |
 | `BLOCK_STATUS` | `429` | Status when blocked |
-| `BLOCK_MESSAGE` | `"Too many requests…"` | JSON `detail` field |
+| `BLOCK_MESSAGE` | `"Too many requests…"` | JSON `detail` field (`gettext_lazy` is fine) |
 | `BLOCK_RESPONSE` | `None` | Dotted path or callable `(request, info) -> HttpResponse` replacing the JSON body |
 | `KEY_FUNC` | `user_or_ip` | Dotted path or callable `(request) -> str` |
 | `TRUSTED_PROXIES` | `[]` | IPs / CIDR networks whose `X-Forwarded-For` is trusted |
+| `IPV6_PREFIX` | `64` | IPv6 clients are keyed on this prefix length (`128` = full address) |
 | `ON_EXCEEDED` | `None` | Dotted path or callable `(request, info)` |
-| `BACKEND` | `"fixed"` | `"fixed"`, `"sliding"`, or dotted path to a `BaseBackend` subclass |
+| `BACKEND` | `"fixed"` | `"fixed"`, `"sliding"`, `"redis"`, or dotted path to a `BaseBackend` subclass |
 | `CACHE_ALIAS` | `"default"` | Which `CACHES` entry to use |
 | `CACHE_PREFIX` | `"tw"` | Key namespace |
-| `HEADERS` | `True` | Emit `X-RateLimit-*` headers |
-| `RECENT_VIOLATIONS` | `100` | How many violations to keep for `trafficwatch_recent` (`0` disables) |
+| `FAIL_OPEN` | `True` | Allow requests (and mark `degraded`) when the cache raises; `False` blocks them |
+| `FAIL_OPEN_LOG_INTERVAL` | `60` | Seconds between outage log records |
+| `LOCKOUT` | `None` | `{"VIOLATIONS": N, "WINDOW_SECONDS": W, "DURATION_SECONDS": D}` escalating lockout |
+| `HEADERS` | `True` | Emit rate-limit headers |
+| `HEADERS_STYLE` | `"x-ratelimit"` | `"x-ratelimit"`, `"ietf"` or `"both"` |
+| `RESET_AS_EPOCH` | `False` | `X-RateLimit-Reset` as a Unix timestamp instead of seconds |
+| `RECENT_VIOLATIONS` | `100` | How many violations to keep for `trafficwatch_recent` / the staff views (`0` disables) |
 
 ## Security notes
 
 - By default the client is keyed on `REMOTE_ADDR` (or the authenticated user). `X-Forwarded-For`
   is **ignored** unless the direct peer is in `TRUSTED_PROXIES`; then the rightmost address not
   belonging to a trusted proxy is used, so a client cannot prepend a fake address.
+- IPv6 clients are keyed on their /64 (`IPV6_PREFIX`), because one subscriber typically owns a
+  whole /64 and could otherwise get a fresh counter per request by rotating addresses.
+- `EXEMPT_CLIENTS` is matched against the same resolved address, never against a raw header.
 - Counting happens before the view runs, so requests rejected by authentication still consume
   quota. That is what makes brute-force protection work.
 - `LocMemCache` is per process. Use Redis or Memcached in production (`manage.py check` warns).
@@ -184,15 +293,17 @@ TRAFFICWATCH = {"BLOCK_RESPONSE": "myproject.views.too_many", ...}
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-pytest
+pip install -e ".[dev,typing]"
+pytest                                        # LocMem
+TW_REDIS_URL=redis://localhost:6379/1 pytest  # the same suite against Redis + Redis-only tests
 ruff check . && ruff format --check src tests
+mypy --strict src
 ```
 
 ## Release
 
 1. Bump `__version__` in `src/django_trafficwatch/__init__.py` and update `CHANGELOG.md`.
-2. `git tag v0.2.0 && git push origin v0.2.0`
+2. `git tag v0.3.0 && git push origin v0.3.0`
 3. The `publish.yml` workflow runs tests, checks the tag matches the version, builds, and
    uploads to PyPI via Trusted Publishing.
 

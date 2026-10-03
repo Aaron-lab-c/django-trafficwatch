@@ -1,6 +1,6 @@
 """django-trafficwatch: configurable traffic monitoring / rate limiting middleware for Django."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .decorators import trafficwatch_exempt, trafficwatch_rule  # noqa: F401
 from .rules import Rule  # noqa: F401
