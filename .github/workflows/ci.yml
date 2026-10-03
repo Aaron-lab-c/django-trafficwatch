@@ -58,6 +58,23 @@ jobs:
       - run: pip install "Django~=${{ matrix.django-version }}.0" -e ".[dev]"
       - run: pytest -q
 
+  # The whole suite against Memcached (PyMemcacheCache): incr on memcached, Lua fallback.
+  test-memcached:
+    runs-on: ubuntu-latest
+    services:
+      memcached:
+        image: memcached:1.6-alpine
+        ports: ["11211:11211"]
+    env:
+      TW_MEMCACHED: localhost:11211
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]" pymemcache
+      - run: pytest -q
+
   # The whole suite again, this time with django.core.cache.backends.redis.RedisCache as the
   # counter store, plus the Redis-only tests (Lua backend, threaded incr atomicity).
   test-redis:
@@ -100,6 +117,9 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      memcached:
+        image: memcached:1.6-alpine
+        ports: ["11211:11211"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -108,7 +128,7 @@ jobs:
       - run: pip install build && python -m build --wheel
       - run: |
           python -m venv /tmp/acc-venv
-          /tmp/acc-venv/bin/pip install dist/*.whl pytest pytest-django pytest-asyncio djangorestframework redis
+          /tmp/acc-venv/bin/pip install dist/*.whl pytest pytest-django pytest-asyncio djangorestframework redis pymemcache gunicorn uvicorn
           mkdir /tmp/acc && cp -r acceptance /tmp/acc/
       - name: Acceptance suite against the installed wheel (LocMem)
         working-directory: /tmp/acc
@@ -121,3 +141,16 @@ jobs:
           TW_ACCEPTANCE_INSTALLED: "1"
           TW_REDIS_URL: redis://localhost:6379/2
         run: /tmp/acc-venv/bin/python -m pytest -c acceptance/pytest.ini acceptance -q
+      - name: Acceptance suite against the installed wheel (Memcached)
+        working-directory: /tmp/acc
+        env:
+          TW_ACCEPTANCE_INSTALLED: "1"
+          TW_MEMCACHED: localhost:11211
+        run: /tmp/acc-venv/bin/python -m pytest -c acceptance/pytest.ini acceptance -q
+      - name: Multi-worker deployment (gunicorn x4, uvicorn x4; Redis and Memcached stores)
+        working-directory: /tmp/acc
+        env:
+          TW_DEPLOY: "1"
+          TW_REDIS_URL: redis://localhost:6379/3
+          TW_MEMCACHED: localhost:11211
+        run: /tmp/acc-venv/bin/python -m pytest -c acceptance/pytest.ini acceptance/deploy -q

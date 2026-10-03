@@ -254,8 +254,13 @@ need `hit`/`reset` and a dotted path in `TRAFFICWATCH["BACKEND"]`.
 - `acceptance/`: black-box tests from the package user's point of view: a real project
   (`acceptance/project/`) configured per the README, driven through HTTP with real time
   (2-second global window) and only public API. CI runs it against the built wheel from a
-  directory outside the repo, on LocMem and on Redis. Add a scenario here whenever a
+  directory outside the repo, on LocMem, Redis and Memcached. Add a scenario here whenever a
   README promise changes.
+- `acceptance/deploy/`: the same project under gunicorn / uvicorn with 4 workers and a
+  shared store (Redis, Memcached), hit by 16 threads at once. Proves exact admission across
+  processes for every backend, cross-process visibility of `trafficwatch_recent`, and the
+  `check --fail-level WARNING` deploy gate. `deploy/bench.py` measures the middleware's
+  per-request overhead (about 1 to 2 ms at p50 on a 4-worker box, see CHANGELOG).
 
 ## Release flow
 

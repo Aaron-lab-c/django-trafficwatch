@@ -342,18 +342,34 @@ mypy --strict src
 tests drive the package only through settings, public decorators and HTTP, one scenario per
 documented feature (limits, rules, identity, exemptions, alerts, inspection, outage, lockout,
 unrouted requests, DRF, ASGI, configuration errors). CI builds the wheel, installs it in a
-clean environment and runs that suite from outside the repository, so a packaging mistake
-fails the build too. Run it yourself against an installed release with:
+clean environment and runs that suite from outside the repository on LocMem, Redis and
+Memcached, so a packaging mistake fails the build too. Run it yourself against an installed
+release with:
 
 ```bash
-cp -r acceptance /tmp/acc && cd /tmp/acc && pip install django-trafficwatch pytest pytest-django pytest-asyncio djangorestframework
-pytest -c acceptance/pytest.ini acceptance
+cp -r acceptance /tmp/acc && cd /tmp/acc
+pip install django-trafficwatch pytest pytest-django pytest-asyncio djangorestframework redis pymemcache gunicorn uvicorn
+pytest -c acceptance/pytest.ini acceptance                                   # LocMem
+TW_REDIS_URL=redis://localhost:6379/1 pytest -c acceptance/pytest.ini acceptance
+TW_MEMCACHED=localhost:11211 pytest -c acceptance/pytest.ini acceptance
+```
+
+`acceptance/deploy/` goes one step further and starts a real multi-process server (gunicorn
+and uvicorn, 4 workers each) with a shared store, then fires 400 concurrent requests from 16
+threads against a budget of 50: exactly 50 must be served, one violation must be recorded
+and readable by `trafficwatch_recent` from another process, and `manage.py check
+--fail-level WARNING` must fail on LocMem and pass on Redis. `python -m deploy.bench` prints
+throughput and latency per backend and store.
+
+```bash
+TW_DEPLOY=1 TW_REDIS_URL=redis://localhost:6379/4 TW_MEMCACHED=localhost:11211 pytest -c acceptance/pytest.ini acceptance/deploy
+cd acceptance && TW_REDIS_URL=redis://localhost:6379/5 TW_MEMCACHED=localhost:11211 python -m deploy.bench
 ```
 
 ## Release
 
 1. Bump `__version__` in `src/django_trafficwatch/__init__.py` and update `CHANGELOG.md`.
-2. `git tag v0.5.0 && git push origin v0.5.0`
+2. `git tag v0.5.1 && git push origin v0.5.1`
 3. The `publish.yml` workflow runs tests, checks the tag matches the version, builds, and
    uploads to PyPI via Trusted Publishing.
 
