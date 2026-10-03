@@ -9,5 +9,5 @@ class TrafficWatchConfig(AppConfig):
     name = "django_trafficwatch"
     verbose_name = "Traffic Watch"
 
-    def ready(self):
+    def ready(self) -> None:
         from . import checks  # noqa: F401  (registers the system checks)

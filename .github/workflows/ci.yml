@@ -17,6 +17,16 @@ jobs:
       - run: ruff check .
       - run: ruff format --check src tests
 
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,typing]"
+      - run: mypy --strict src
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -45,5 +55,32 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - run: pip install "Django~=${{ matrix.django-version }}.0" -e ".[dev]"
+      - run: pytest -q
+
+  # The whole suite again, this time with django.core.cache.backends.redis.RedisCache as the
+  # counter store, plus the Redis-only tests (Lua backend, threaded incr atomicity).
+  test-redis:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    strategy:
+      fail-fast: false
+      matrix:
+        django-version: ["4.2", "6.1"]
+    env:
+      TW_REDIS_URL: redis://localhost:6379/1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: pip install "Django~=${{ matrix.django-version }}.0" -e ".[dev]"
       - run: pytest -q

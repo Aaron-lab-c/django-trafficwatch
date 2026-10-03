@@ -5,22 +5,26 @@ trafficwatch.W0xx are things that work but probably not as intended."""
 
 from __future__ import annotations
 
-import ipaddress
+from typing import Any
 
 from django.conf import settings
-from django.core.checks import Error, Tags, Warning, register
+from django.core.checks import CheckMessage, Error, Tags, Warning, register
 from django.utils.module_loading import import_string
 
-from .conf import _IMPORTABLE, DEFAULTS, tw_settings
+from .conf import _IMPORTABLE, DEFAULTS, HEADER_STYLES, parse_lockout, parse_networks, tw_settings
 from .rules import RuleConfigError, RuleSet
 
 MIDDLEWARE_PATH = "django_trafficwatch.middleware.TrafficWatchMiddleware"
 AUTH_MIDDLEWARE = "django.contrib.auth.middleware.AuthenticationMiddleware"
 
 
+def _is_positive_int(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value > 0
+
+
 @register(Tags.security)
-def check_trafficwatch_settings(app_configs, **kwargs):
-    errors: list = []
+def check_trafficwatch_settings(app_configs: Any, **kwargs: Any) -> list[CheckMessage]:
+    errors: list[CheckMessage] = []
     user = getattr(settings, "TRAFFICWATCH", {}) or {}
 
     if not isinstance(user, dict):
@@ -36,9 +40,9 @@ def check_trafficwatch_settings(app_configs, **kwargs):
             )
         )
 
-    for name in ("WINDOW_SECONDS", "MAX_REQUESTS"):
+    for name in ("WINDOW_SECONDS", "MAX_REQUESTS", "FAIL_OPEN_LOG_INTERVAL"):
         value = user.get(name, DEFAULTS[name])
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        if not _is_positive_int(value) and not (name == "FAIL_OPEN_LOG_INTERVAL" and value == 0):
             errors.append(
                 Error(f"TRAFFICWATCH[{name!r}] must be a positive integer.", id="trafficwatch.E002")
             )
@@ -52,7 +56,7 @@ def check_trafficwatch_settings(app_configs, **kwargs):
     except (RuleConfigError, ImportError, TypeError) as exc:
         errors.append(Error(f"Invalid TRAFFICWATCH PATH_RULES: {exc}", id="trafficwatch.E003"))
 
-    for name in _IMPORTABLE:
+    for name in sorted(_IMPORTABLE):
         value = user.get(name)
         if isinstance(value, str):
             try:
@@ -71,24 +75,18 @@ def check_trafficwatch_settings(app_configs, **kwargs):
                 )
             )
 
+    backend_cls = None
     try:
-        tw_settings.backend_class()
+        backend_cls = tw_settings.backend_class()
     except ImportError as exc:
         errors.append(
             Error(f"TRAFFICWATCH['BACKEND'] cannot be imported: {exc}", id="trafficwatch.E005")
         )
 
-    for entry in user.get("TRUSTED_PROXIES", []):
-        try:
-            ipaddress.ip_network(entry, strict=False)
-        except ValueError:
-            errors.append(
-                Error(
-                    f"TRAFFICWATCH['TRUSTED_PROXIES'] entry {entry!r} is not an IP or CIDR "
-                    "network.",
-                    id="trafficwatch.E006",
-                )
-            )
+    try:
+        parse_networks(user.get("TRUSTED_PROXIES", []), "TRUSTED_PROXIES")
+    except RuleConfigError as exc:
+        errors.append(Error(f"TRAFFICWATCH['{exc}", id="trafficwatch.E006"))
 
     for name in ("EXEMPT_PATHS", "EXEMPT_METHODS"):
         value = user.get(name, DEFAULTS[name])
@@ -99,6 +97,7 @@ def check_trafficwatch_settings(app_configs, **kwargs):
 
     alias = user.get("CACHE_ALIAS", DEFAULTS["CACHE_ALIAS"])
     caches = getattr(settings, "CACHES", {})
+    cache_backend = caches.get(alias, {}).get("BACKEND", "").lower() if alias in caches else ""
     if alias not in caches:
         errors.append(
             Error(
@@ -106,13 +105,74 @@ def check_trafficwatch_settings(app_configs, **kwargs):
                 id="trafficwatch.E008",
             )
         )
-    elif "locmem" in caches[alias].get("BACKEND", "").lower() and not settings.DEBUG:
+    elif "locmem" in cache_backend and not settings.DEBUG:
         errors.append(
             Warning(
                 "TRAFFICWATCH uses LocMemCache, which is per-process: limits are not shared "
                 "between workers or hosts.",
                 hint="Point CACHE_ALIAS at a Redis or Memcached cache in production.",
                 id="trafficwatch.W002",
+            )
+        )
+
+    try:
+        parse_networks(user.get("EXEMPT_CLIENTS", []), "EXEMPT_CLIENTS")
+    except RuleConfigError as exc:
+        errors.append(Error(f"TRAFFICWATCH['{exc}", id="trafficwatch.E009"))
+
+    prefix = user.get("IPV6_PREFIX", DEFAULTS["IPV6_PREFIX"])
+    if not _is_positive_int(prefix) or prefix > 128:
+        errors.append(
+            Error(
+                "TRAFFICWATCH['IPV6_PREFIX'] must be an integer between 1 and 128.",
+                id="trafficwatch.E010",
+            )
+        )
+
+    try:
+        parse_lockout(user.get("LOCKOUT"))
+    except RuleConfigError as exc:
+        errors.append(Error(f"TRAFFICWATCH['{exc}", id="trafficwatch.E011"))
+
+    style = user.get("HEADERS_STYLE", DEFAULTS["HEADERS_STYLE"])
+    if style not in HEADER_STYLES:
+        errors.append(
+            Error(
+                f"TRAFFICWATCH['HEADERS_STYLE'] must be one of {list(HEADER_STYLES)}.",
+                id="trafficwatch.E012",
+            )
+        )
+
+    for name in ("FAIL_OPEN", "RESET_AS_EPOCH", "MATCH_PATH_INFO", "HEADERS", "BLOCK"):
+        if not isinstance(user.get(name, DEFAULTS[name]), bool):
+            errors.append(
+                Error(f"TRAFFICWATCH[{name!r}] must be a boolean.", id="trafficwatch.E013")
+            )
+
+    if user.get("FAIL_OPEN", DEFAULTS["FAIL_OPEN"]) is False:
+        errors.append(
+            Warning(
+                "TRAFFICWATCH['FAIL_OPEN'] is False: every request is rejected with the block "
+                "response while the cache is unreachable.",
+                hint="Leave FAIL_OPEN=True to let requests through (request.trafficwatch."
+                "degraded is set and the outage is logged on the django_trafficwatch logger).",
+                id="trafficwatch.W005",
+            )
+        )
+
+    if (
+        user.get("BACKEND") == "redis"
+        and backend_cls is not None
+        and alias in caches
+        and "redis" not in cache_backend
+    ):
+        errors.append(
+            Warning(
+                f"TRAFFICWATCH['BACKEND'] is 'redis' but CACHES[{alias!r}] is "
+                f"{caches[alias].get('BACKEND')!r}; the sliding-window backend will be used.",
+                hint="Point CACHE_ALIAS at django.core.cache.backends.redis.RedisCache or "
+                "django_redis.cache.RedisCache.",
+                id="trafficwatch.W006",
             )
         )
 

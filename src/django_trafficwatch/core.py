@@ -1,27 +1,73 @@
 """Framework-agnostic enforcement logic shared by the middleware and the DRF throttle.
 
 ``TrafficWatch.check()`` evaluates a set of rules for a request and returns a
-``TrafficWatchState``; notification (log, signal, callback, recent-violations store) and
-building the block response live here too so both entry points behave identically.
+``TrafficWatchState``; notification (log, signal, callback, recent-violations store),
+escalating lockout, fail-open handling and building the block response live here too so
+both entry points behave identically.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import threading
+import time
 from dataclasses import dataclass
+from typing import Any
 
 from django.http import HttpResponse, JsonResponse
 
 from . import stats
 from .backends.base import BaseBackend, HitResult
 from .conf import tw_settings
-from .keys import safe_key_part
+from .keys import is_exempt_client, safe_key_part
 from .rules import Rule
 from .signals import traffic_exceeded
 
 logger = logging.getLogger("django_trafficwatch")
 
 REQUEST_ATTR = "trafficwatch"
+LOCKOUT_RULE_NAME = "lockout"
+
+_outage_lock = threading.Lock()
+_outage_logged_at = 0.0
+
+
+def _sf_string(value: str) -> str:
+    """Quote a value as an HTTP Structured Field string (RFC 8941)."""
+    printable = "".join(ch if " " <= ch <= "~" else "?" for ch in value)
+    return '"' + printable.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+@dataclass(frozen=True)
+class LockoutState:
+    """Escalating-lockout bookkeeping for one request (``request.trafficwatch.lockout``)."""
+
+    violations: int  # crossings seen in the lockout window, including this one
+    threshold: int  # LOCKOUT["VIOLATIONS"]
+    window: int
+    duration: int
+    locked_until: float | None  # epoch seconds, None when not locked
+
+    @property
+    def active(self) -> bool:
+        return self.locked_until is not None and self.locked_until > time.time()
+
+    @property
+    def retry_after(self) -> int:
+        if self.locked_until is None:
+            return 0
+        return max(math.ceil(self.locked_until - time.time()), 1)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "violations": self.violations,
+            "threshold": self.threshold,
+            "window": self.window,
+            "duration": self.duration,
+            "locked_until": self.locked_until,
+            "active": self.active,
+        }
 
 
 @dataclass(frozen=True)
@@ -36,8 +82,11 @@ class RuleResult:
         block = self.rule.block if self.rule.block is not None else tw_settings.BLOCK
         return bool(block and self.result.exceeded)
 
-    def info(self, request) -> dict:
+    def info(
+        self, request: Any, *, lockout: LockoutState | None = None, degraded: bool = False
+    ) -> dict[str, Any]:
         """Serializable summary handed to the signal, ON_EXCEEDED and the recent store."""
+        locked = lockout is not None and lockout.active
         return {
             "client": self.client,
             "path": request.path,
@@ -47,20 +96,30 @@ class RuleResult:
             "limit": self.result.limit,
             "window": self.rule.window,
             "reset_in": self.result.reset_in,
-            "blocked": self.blocks,
+            "blocked": self.blocks or locked,
+            "lockout": lockout.as_dict() if lockout is not None else None,
+            "degraded": degraded,
         }
 
 
 @dataclass(frozen=True)
 class TrafficWatchState:
     """Everything the middleware learnt about one request. Exposed as ``request.trafficwatch``
-    so views, templates and log filters can read it."""
+    so views, templates and log filters can read it.
+
+    ``results`` is empty when the request was not counted: during a cache outage
+    (``degraded``) or while the client is locked out (``lockout.active``)."""
 
     results: tuple[RuleResult, ...]
+    degraded: bool = False
+    lockout: LockoutState | None = None
+    fallback_retry_after: int = 1  # Retry-After when no rule result is available
 
     @property
-    def strictest(self) -> RuleResult:
-        """The rule closest to (or furthest past) its limit; drives the X-RateLimit headers."""
+    def strictest(self) -> RuleResult | None:
+        """The rule closest to (or furthest past) its limit; drives the rate-limit headers."""
+        if not self.results:
+            return None
         return min(
             self.results,
             key=lambda r: (
@@ -71,80 +130,220 @@ class TrafficWatchState:
         )
 
     @property
+    def locked(self) -> bool:
+        return self.lockout is not None and self.lockout.active
+
+    @property
     def exceeded(self) -> bool:
-        return any(r.result.exceeded for r in self.results)
+        return self.locked or any(r.result.exceeded for r in self.results)
 
     @property
     def blocked(self) -> bool:
-        return any(r.blocks for r in self.results)
+        if self.degraded and not tw_settings.FAIL_OPEN:
+            return True
+        return self.locked or any(r.blocks for r in self.results)
 
     @property
     def retry_after(self) -> int:
-        """Seconds until every blocking rule would accept a request again."""
+        """Seconds until every blocking rule (and the lockout) would accept a request again."""
         waits = [r.result.reset_in for r in self.results if r.blocks]
-        return max(waits) if waits else self.strictest.result.reset_in
+        if self.lockout is not None and self.lockout.active:
+            waits.append(self.lockout.retry_after)
+        if waits:
+            return max(waits)
+        strictest = self.strictest
+        return strictest.result.reset_in if strictest else self.fallback_retry_after
+
+    def info(self, request: Any) -> dict[str, Any]:
+        """Info dict for the block response: the strictest blocking rule, or a rule-less
+        summary when the request was rejected by the lockout / fail-closed outage."""
+        blocking = [r for r in self.results if r.blocks]
+        if blocking:
+            strictest = max(blocking, key=lambda r: r.result.reset_in)
+            info = strictest.info(request, lockout=self.lockout, degraded=self.degraded)
+        else:
+            try:
+                client = tw_settings.KEY_FUNC(request)
+            except Exception:  # never let a broken key func hide the block
+                client = "unknown"
+            info = {
+                "client": client,
+                "path": request.path,
+                "method": request.method,
+                "rule": LOCKOUT_RULE_NAME if self.locked else None,
+                "count": None,
+                "limit": None,
+                "window": None,
+                "reset_in": self.retry_after,
+                "blocked": True,
+                "lockout": self.lockout.as_dict() if self.lockout is not None else None,
+                "degraded": self.degraded,
+            }
+        info["retry_after"] = self.retry_after
+        return info
 
     def headers(self) -> dict[str, str]:
-        s = self.strictest.result
-        return {
-            "X-RateLimit-Limit": str(s.limit),
-            "X-RateLimit-Remaining": str(s.remaining),
-            "X-RateLimit-Reset": str(s.reset_in),
-        }
+        style = tw_settings.HEADERS_STYLE
+        headers: dict[str, str] = {}
+        strictest = self.strictest
+        if strictest is None:
+            if self.locked and style in ("ietf", "both"):
+                headers["RateLimit"] = f"{_sf_string(LOCKOUT_RULE_NAME)};r=0;t={self.retry_after}"
+            return headers
+        s = strictest.result
+        if style in ("x-ratelimit", "both"):
+            reset = s.reset_in
+            if tw_settings.RESET_AS_EPOCH:
+                reset = int(time.time()) + reset
+            headers["X-RateLimit-Limit"] = str(s.limit)
+            headers["X-RateLimit-Remaining"] = str(s.remaining)
+            headers["X-RateLimit-Reset"] = str(reset)
+        if style in ("ietf", "both"):
+            headers["RateLimit-Policy"] = ", ".join(
+                f"{_sf_string(r.rule.name)};q={r.rule.limit};w={r.rule.window}"
+                for r in self.results
+            )
+            name, remaining, reset_in = strictest.rule.name, s.remaining, s.reset_in
+            if self.locked:
+                name, remaining, reset_in = LOCKOUT_RULE_NAME, 0, self.retry_after
+            headers["RateLimit"] = f"{_sf_string(name)};r={remaining};t={reset_in}"
+        return headers
+
+
+def is_exempt_request(request: Any) -> bool:
+    """EXEMPT_METHODS / EXEMPT_PATHS / EXEMPT_CLIENTS / EXEMPT_FUNC (view decorators are
+    checked separately by the caller, which knows the view)."""
+    if request.method in tw_settings.EXEMPT_METHODS:
+        return True
+    path = tw_settings.match_path(request)
+    if any(path.startswith(p) for p in tw_settings.EXEMPT_PATHS):
+        return True
+    if is_exempt_client(request):
+        return True
+    func = tw_settings.EXEMPT_FUNC
+    return bool(func is not None and func(request))
 
 
 class TrafficWatch:
     def __init__(self, backend: BaseBackend | None = None):
-        self.backend = backend or tw_settings.backend_class()(
+        self.backend: BaseBackend = backend or tw_settings.backend_class()(
             tw_settings.CACHE_ALIAS, tw_settings.CACHE_PREFIX
         )
 
     # -- evaluation ----------------------------------------------------------
 
-    def check(self, request, rules: tuple[Rule, ...]) -> TrafficWatchState:
+    def check(self, request: Any, rules: tuple[Rule, ...]) -> TrafficWatchState:
         """Count this request against every rule, fire notifications for rules that were
         just crossed and return the combined state. Does not build a response."""
         default_key_func = tw_settings.KEY_FUNC
-        results = []
-        for rule in rules:
-            client = (rule.key_func or default_key_func)(request)
-            hit = self.backend.hit(
-                safe_key_part(client), safe_key_part(rule.name), rule.window, rule.limit
-            )
-            results.append(RuleResult(rule=rule, client=client, result=hit))
+        lockout_cfg = tw_settings.lockout
+        clients = [(rule.key_func or default_key_func)(request) for rule in rules]
+        lock_client = safe_key_part(default_key_func(request)) if lockout_cfg else None
 
-        state = TrafficWatchState(results=tuple(results))
-        for rr in state.results:
-            if rr.result.just_exceeded:
-                self.notify(request, rr)
+        try:
+            if lockout_cfg is not None and lock_client is not None:
+                until = self.backend.locked_until(lock_client)
+                if until is not None:
+                    active = LockoutState(
+                        violations=lockout_cfg.violations,
+                        threshold=lockout_cfg.violations,
+                        window=lockout_cfg.window,
+                        duration=lockout_cfg.duration,
+                        locked_until=until,
+                    )
+                    return TrafficWatchState(results=(), lockout=active)
+
+            hits = self.backend.hit_many(
+                [
+                    (safe_key_part(client), safe_key_part(rule.name), rule.window, rule.limit)
+                    for client, rule in zip(clients, rules)
+                ]
+            )
+            results = tuple(
+                RuleResult(rule=rule, client=client, result=hit)
+                for rule, client, hit in zip(rules, clients, hits)
+            )
+            crossed = [rr for rr in results if rr.result.just_exceeded]
+
+            lockout: LockoutState | None = None
+            if lockout_cfg is not None and lock_client is not None and crossed:
+                violations = self.backend.count_violation(lock_client, lockout_cfg.window)
+                until = None
+                if violations >= lockout_cfg.violations:
+                    until = self.backend.lock(lock_client, lockout_cfg.duration)
+                lockout = LockoutState(
+                    violations=violations,
+                    threshold=lockout_cfg.violations,
+                    window=lockout_cfg.window,
+                    duration=lockout_cfg.duration,
+                    locked_until=until,
+                )
+        except Exception:
+            return self._degraded(rules)
+
+        state = TrafficWatchState(results=results, lockout=lockout)
+        for rr in crossed:
+            self.notify(request, rr, state)
         return state
 
-    def peek(self, request, rules: tuple[Rule, ...]) -> TrafficWatchState | None:
+    def peek(self, request: Any, rules: tuple[Rule, ...]) -> TrafficWatchState | None:
         """Read-only view of the counters (no request is counted). None if the backend
         cannot answer."""
         default_key_func = tw_settings.KEY_FUNC
-        results = []
-        for rule in rules:
-            client = (rule.key_func or default_key_func)(request)
-            hit = self.backend.peek(
-                safe_key_part(client), safe_key_part(rule.name), rule.window, rule.limit
+        clients = [(rule.key_func or default_key_func)(request) for rule in rules]
+        try:
+            hits = self.backend.peek_many(
+                [
+                    (safe_key_part(client), safe_key_part(rule.name), rule.window, rule.limit)
+                    for client, rule in zip(clients, rules)
+                ]
             )
-            if hit is None:
-                return None
-            results.append(RuleResult(rule=rule, client=client, result=hit))
-        return TrafficWatchState(results=tuple(results))
+        except Exception:
+            return None
+        if hits is None:
+            return None
+        return TrafficWatchState(
+            results=tuple(
+                RuleResult(rule=rule, client=client, result=hit)
+                for rule, client, hit in zip(rules, clients, hits)
+            )
+        )
+
+    def _degraded(self, rules: tuple[Rule, ...]) -> TrafficWatchState:
+        """The cache raised: log (rate limited) and return an empty, degraded state."""
+        global _outage_logged_at
+        now = time.time()
+        interval = float(tw_settings.FAIL_OPEN_LOG_INTERVAL or 0)
+        with _outage_lock:
+            should_log = now - _outage_logged_at >= interval
+            if should_log:
+                _outage_logged_at = now
+        if should_log:
+            logger.error(
+                "TrafficWatch cache backend unavailable; %s requests until it recovers "
+                "(FAIL_OPEN=%s).",
+                "allowing" if tw_settings.FAIL_OPEN else "blocking",
+                tw_settings.FAIL_OPEN,
+                exc_info=True,
+            )
+        retry = min((rule.window for rule in rules), default=60)
+        return TrafficWatchState(results=(), degraded=True, fallback_retry_after=retry)
 
     # -- side effects --------------------------------------------------------
 
-    def notify(self, request, rr: RuleResult) -> None:
-        info = rr.info(request)
+    def notify(self, request: Any, rr: RuleResult, state: TrafficWatchState | None = None) -> None:
+        lockout = state.lockout if state is not None else None
+        info = rr.info(request, lockout=lockout)
         logger.warning(
             "Traffic limit exceeded: rule=%(rule)s client=%(client)s %(method)s %(path)s "
             "count=%(count)s limit=%(limit)s/%(window)ss blocked=%(blocked)s",
             info,
             extra={"trafficwatch": info},
         )
-        stats.record_violation(info)
+        try:
+            stats.record_violation(info)
+        except Exception:  # the cache may be flapping; never break the request
+            logger.exception("TrafficWatch could not record the violation")
         traffic_exceeded.send(sender=self.__class__, request=request, info=info)
         callback = tw_settings.ON_EXCEEDED
         if callback:
@@ -153,18 +352,18 @@ class TrafficWatch:
             except Exception:  # a broken alert hook must never break the request
                 logger.exception("TRAFFICWATCH ON_EXCEEDED callback failed")
 
-    def block_response(self, request, state: TrafficWatchState) -> HttpResponse:
+    def block_response(self, request: Any, state: TrafficWatchState) -> HttpResponse:
         retry_after = state.retry_after
-        strictest = min((r for r in state.results if r.blocks), key=lambda r: -r.result.reset_in)
-        info = strictest.info(request)
-        info["retry_after"] = retry_after
+        info = state.info(request)
 
         custom = tw_settings.BLOCK_RESPONSE
+        response: HttpResponse
         if custom:
             response = custom(request, info)
         else:
             response = JsonResponse(
-                {"detail": tw_settings.BLOCK_MESSAGE, "retry_after": retry_after},
+                # str() so a gettext_lazy BLOCK_MESSAGE serialises in the active language.
+                {"detail": str(tw_settings.BLOCK_MESSAGE), "retry_after": retry_after},
                 status=tw_settings.BLOCK_STATUS,
             )
         response["Retry-After"] = str(retry_after)

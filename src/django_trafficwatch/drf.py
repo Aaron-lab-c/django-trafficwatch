@@ -17,11 +17,13 @@ throttle runs, so the throttle simply defers to it and nothing is counted twice.
 
 from __future__ import annotations
 
+from typing import Any
+
 from rest_framework.throttling import BaseThrottle
 
 from .conf import tw_settings
-from .core import REQUEST_ATTR, TrafficWatch, TrafficWatchState
-from .decorators import RULES_ATTR, is_exempt_view
+from .core import REQUEST_ATTR, TrafficWatch, TrafficWatchState, is_exempt_request
+from .decorators import class_rules, is_exempt_class
 
 _watch: TrafficWatch | None = None
 
@@ -29,15 +31,17 @@ _watch: TrafficWatch | None = None
 def _shared_watch() -> TrafficWatch:
     global _watch
     if _watch is None:
+        tw_settings.validate()
         _watch = TrafficWatch()
     return _watch
 
 
-class TrafficWatchThrottle(BaseThrottle):
+class TrafficWatchThrottle(BaseThrottle):  # type: ignore[misc]
     state: TrafficWatchState | None = None
 
-    def allow_request(self, request, view) -> bool:
+    def allow_request(self, request: Any, view: Any) -> bool:
         django_request = getattr(request, "_request", request)
+        method = request.method or "GET"
 
         # Middleware already evaluated (and would have blocked) this request.
         if hasattr(django_request, REQUEST_ATTR):
@@ -45,20 +49,20 @@ class TrafficWatchThrottle(BaseThrottle):
             return True
 
         view_cls = view if isinstance(view, type) else type(view)
-        if is_exempt_view(view_cls):
+        if is_exempt_request(django_request) or is_exempt_class(view_cls, method):
             return True
 
-        rules = tuple(getattr(view_cls, RULES_ATTR, ()))
+        rules = class_rules(view_cls, method)
         if rules:
-            rules = tuple(r for r in rules if r.applies_to(request.method))
+            rules = tuple(r for r in rules if r.applies_to(method))
         if not rules:
-            rules = tw_settings.rules_for(django_request.path, request.method)
+            rules = tw_settings.rules_for(tw_settings.match_path(django_request), method)
 
         self.state = _shared_watch().check(django_request, rules)
         setattr(django_request, REQUEST_ATTR, self.state)
         return not self.state.blocked
 
-    def wait(self):
+    def wait(self) -> float | None:
         if self.state is None:
             return None
         return self.state.retry_after

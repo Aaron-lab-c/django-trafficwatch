@@ -1,3 +1,7 @@
+import os
+
+import pytest
+
 from django_trafficwatch.checks import check_trafficwatch_settings
 
 
@@ -20,9 +24,9 @@ def test_bad_path_rules_error(tw):
 
 
 def test_bad_dotted_paths_error(tw):
-    tw(KEY_FUNC="nope.nothing", BACKEND="nope.Backend", ON_EXCEEDED=42)
+    tw(KEY_FUNC="nope.nothing", BACKEND="nope.Backend", ON_EXCEEDED=42, EXEMPT_FUNC="x.y")
     found = ids(check_trafficwatch_settings(None))
-    assert found.count("trafficwatch.E004") == 2
+    assert found.count("trafficwatch.E004") == 3
     assert "trafficwatch.E005" in found
 
 
@@ -41,6 +45,12 @@ def test_missing_cache_alias_error(tw):
     assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E008"]
 
 
+locmem_only = pytest.mark.skipif(
+    bool(os.environ.get("TW_REDIS_URL")), reason="suite is running against Redis"
+)
+
+
+@locmem_only
 def test_locmem_in_production_warns(settings):
     settings.DEBUG = False
     assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.W002"]
@@ -70,3 +80,63 @@ def test_manage_check_runs_registered_check(tw):
 
     with pytest.raises(SystemCheckError, match="trafficwatch.E003"):
         call_command("check")
+
+
+def test_bad_exempt_clients_error(tw):
+    tw(EXEMPT_CLIENTS=["10.0.0.0/8", "nope"])
+    assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E009"]
+
+
+@pytest.mark.parametrize("prefix", [0, 129, "64", True])
+def test_bad_ipv6_prefix_error(tw, prefix):
+    tw(IPV6_PREFIX=prefix)
+    assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E010"]
+
+
+@pytest.mark.parametrize(
+    "lockout",
+    [
+        {"VIOLATIONS": 3},
+        {"VIOLATIONS": 0, "WINDOW_SECONDS": 60, "DURATION_SECONDS": 60},
+        {"VIOLATIONS": 3, "WINDOW_SECONDS": 60, "DURATION_SECONDS": 60, "EXTRA": 1},
+        5,
+    ],
+)
+def test_bad_lockout_error(tw, lockout):
+    tw(LOCKOUT=lockout)
+    assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E011"]
+
+
+def test_good_lockout_passes(tw):
+    tw(LOCKOUT={"VIOLATIONS": 3, "WINDOW_SECONDS": 60, "DURATION_SECONDS": 60})
+    assert check_trafficwatch_settings(None) == []
+
+
+def test_bad_headers_style_error(tw):
+    tw(HEADERS_STYLE="rfc")
+    assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E012"]
+
+
+def test_non_boolean_flags_error(tw):
+    tw(FAIL_OPEN="yes", MATCH_PATH_INFO=1)
+    assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E013", "trafficwatch.E013"]
+
+
+def test_fail_closed_warns(tw):
+    tw(FAIL_OPEN=False)
+    found = check_trafficwatch_settings(None)
+    assert ids(found) == ["trafficwatch.W005"]
+    assert "degraded" in found[0].hint
+
+
+@locmem_only
+def test_redis_backend_on_non_redis_cache_warns(tw):
+    tw(BACKEND="redis")
+    assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.W006"]
+
+
+def test_log_interval_zero_is_allowed(tw):
+    tw(FAIL_OPEN_LOG_INTERVAL=0)
+    assert check_trafficwatch_settings(None) == []
+    tw(FAIL_OPEN_LOG_INTERVAL=-1)
+    assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E002"]

@@ -1,5 +1,6 @@
 from django.http import HttpResponse, JsonResponse
-from django.urls import path
+from django.urls import include, path
+from django.utils.decorators import method_decorator
 from django.views import View
 
 from django_trafficwatch import trafficwatch_exempt, trafficwatch_rule
@@ -20,6 +21,7 @@ def echo_state(request):
         {
             "exceeded": state.exceeded,
             "blocked": state.blocked,
+            "degraded": state.degraded,
             "rules": [r.rule.name for r in state.results],
             "counts": [r.result.count for r in state.results],
         }
@@ -59,6 +61,37 @@ class ExemptClassView(View):
         return HttpResponse("cbv exempt")
 
 
+@method_decorator(trafficwatch_rule(60, 1), name="post")
+class MethodDecoratedView(View):
+    """``method_decorator`` on one handler: only POST carries the rule."""
+
+    def get(self, request):
+        return HttpResponse("md get")
+
+    def post(self, request):
+        return HttpResponse("md post")
+
+
+@method_decorator(trafficwatch_rule(60, 1), name="post")
+class OtherMethodDecoratedView(View):
+    """Same decoration on a second class: must not share a counter with the first."""
+
+    def post(self, request):
+        return HttpResponse("md post 2")
+
+
+@method_decorator(trafficwatch_rule(60, 1), name="dispatch")
+class DispatchDecoratedView(View):
+    def get(self, request):
+        return HttpResponse("md dispatch")
+
+
+@method_decorator(trafficwatch_exempt, name="dispatch")
+class DispatchExemptView(View):
+    def get(self, request):
+        return HttpResponse("md exempt")
+
+
 urlpatterns = [
     path("", ok),
     path("async/", async_ok),
@@ -74,6 +107,11 @@ urlpatterns = [
     path("decorated/post-only/", post_only_view),
     path("cbv/strict/", StrictClassView.as_view()),
     path("cbv/exempt/", ExemptClassView.as_view()),
+    path("cbv/method/", MethodDecoratedView.as_view()),
+    path("cbv/method2/", OtherMethodDecoratedView.as_view()),
+    path("cbv/dispatch/", DispatchDecoratedView.as_view()),
+    path("cbv/dispatch-exempt/", DispatchExemptView.as_view()),
+    path("trafficwatch/", include("django_trafficwatch.urls")),
 ]
 
 try:

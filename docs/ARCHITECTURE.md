@@ -12,35 +12,42 @@
 
 ```
 settings.TRAFFICWATCH ──> conf.tw_settings ──> rules.RuleSet   (compiled, cached, rebuilt on setting_changed)
-                                │
+                                │               conf.LockoutConfig
+                                │  validate() at middleware construction -> ImproperlyConfigured
                                 ▼
 TrafficWatchMiddleware ──┐
-                         ├──> core.TrafficWatch.check(request, rules)
-drf.TrafficWatchThrottle ┘        │  for each rule:
-                                  │     client = (rule.key_func or KEY_FUNC)(request)
-                                  │     backend.hit(client, rule.name, window, limit) -> HitResult
+                         ├──> core.is_exempt_request  (EXEMPT_METHODS/PATHS/CLIENTS/FUNC)
+drf.TrafficWatchThrottle ┘
+                         └──> core.TrafficWatch.check(request, rules)
+                                  │  lockout? backend.locked_until(client) -> blocked, nothing counted
+                                  │  clients = [(rule.key_func or KEY_FUNC)(request) ...]
+                                  │  backend.hit_many([(client, rule.name, window, limit) ...])
+                                  │  crossings -> backend.count_violation / backend.lock
+                                  │  backend raised -> degraded state (FAIL_OPEN decides)
                                   ▼
                             TrafficWatchState (request.trafficwatch)
                                   │
         ├── any rule just_exceeded -> logger.warning(extra=info) + stats.record_violation
-        │                            + traffic_exceeded signal + ON_EXCEEDED
+        │                            + traffic_exceeded signal + ON_EXCEEDED   (info["lockout"])
         ├── state.blocked           -> BLOCK_RESPONSE or JSON 429, Retry-After
-        └── always                  -> X-RateLimit-* headers (strictest rule)
+        └── always                  -> X-RateLimit-* and/or RateLimit headers (strictest rule)
 ```
 
 | Module | Responsibility |
 |---|---|
-| `conf.py` | Defaults, lazy access to `settings.TRAFFICWATCH`, cached `RuleSet`, backend alias lookup |
+| `conf.py` | Defaults, lazy access to `settings.TRAFFICWATCH`, cached `RuleSet` / `LockoutConfig`, backend alias lookup, eager `validate()` |
 | `rules.py` | `Rule` dataclass, validation of `PATH_RULES`, prefix/regex matching, method filtering |
-| `keys.py` | Built-in client identifiers (`client_ip` with trusted-proxy logic, `user_or_ip`), cache-safe key hashing |
-| `core.py` | `TrafficWatch` (count, notify, build block response), `TrafficWatchState`, header application |
-| `backends/base.py` | `BaseBackend` contract (`hit`, `peek`, `reset`) + `HitResult` + atomic `_incr` helper |
+| `keys.py` | Built-in client identifiers (`client_ip` with trusted-proxy logic and IPv6 prefix, `user_or_ip`), `EXEMPT_CLIENTS` matching, cache-safe key hashing |
+| `core.py` | `TrafficWatch` (count, lockout, fail-open, notify, build block response), `TrafficWatchState`, `LockoutState`, header rendering, `is_exempt_request` |
+| `backends/base.py` | `BaseBackend` contract (`hit`, `peek`, `reset`, `hit_many`, `peek_many`, lockout helpers) + `HitResult` + atomic `_incr` helper |
 | `backends/fixed_window.py` | Aligned bucket counter — cheapest, exact per bucket |
 | `backends/sliding_window.py` | Two-bucket weighted estimate — smooths bursts, honest `Retry-After` |
-| `decorators.py` | `@trafficwatch_exempt`, `@trafficwatch_rule(...)` (stackable, CBV-aware) |
-| `middleware.py` | Django entry point, sync + async capable |
+| `backends/redis_lua.py` | Same estimate, all rules in one Lua script on the raw redis-py client; falls back to sliding when the cache is not Redis |
+| `decorators.py` | `@trafficwatch_exempt`, `@trafficwatch_rule(...)` (stackable, CBV- and `method_decorator`-aware) |
+| `middleware.py` | Django entry point, sync + async capable, validates settings at construction |
 | `drf.py` | `TrafficWatchThrottle` for Django REST Framework (optional dependency) |
 | `stats.py` | Bounded "recent violations" list in the cache |
+| `views.py` / `urls.py` | Staff-only `recent/` (HTML) and `recent.json` inspection endpoints |
 | `checks.py` / `apps.py` | System checks registered when the app is in `INSTALLED_APPS` |
 | `management/commands/trafficwatch_recent.py` | Inspect / clear recent violations |
 | `signals.py` | `traffic_exceeded` Django signal |
@@ -50,16 +57,29 @@ drf.TrafficWatchThrottle ┘        │  for each rule:
 1. `__call__` runs the rest of the stack, then decorates the outgoing response with headers.
    Under ASGI `__acall__` does the same without leaving the event loop.
 2. `process_view` (runs after URL resolution, so the view function is known):
-   1. Skip if `request.method` is in `EXEMPT_METHODS`, the path starts with an `EXEMPT_PATHS`
-      prefix, or the view (or its `view_class`) is `@trafficwatch_exempt`.
-   2. Resolve rules: view decorators filtered by method → `PATH_RULES` (regex first, then
-      longest prefix; method-filtered) → global rule. Never empty.
-   3. For every rule: `client = key_func(request)`, one atomic `incr`.
-   4. Store the `TrafficWatchState` on `request.trafficwatch`.
-   5. For each rule crossed for the first time (`count == limit + 1`): log, record, signal,
-      callback.
-   6. If any exceeded rule blocks (per-rule `BLOCK`, else global): return the block response
-      with `Retry-After` = the longest wait among blocking rules. The view never runs.
+   1. Skip if `request.method` is in `EXEMPT_METHODS`, the match path (`request.path`, or
+      `request.path_info` with `MATCH_PATH_INFO`) starts with an `EXEMPT_PATHS` prefix, the
+      resolved client IP is in `EXEMPT_CLIENTS`, `EXEMPT_FUNC(request)` is true, or the view
+      (its `view_class`, `dispatch` or the handler for the method) is `@trafficwatch_exempt`.
+   2. Resolve rules: view decorators (class, `dispatch`, method handler) filtered by method →
+      `PATH_RULES` (regex first, then longest prefix; method-filtered) → global rule. Never
+      empty.
+   3. If `LOCKOUT` is configured and the client is locked: an empty state with
+      `lockout.active`; nothing is counted.
+   4. Otherwise `client = key_func(request)` per rule and one `backend.hit_many()` call (the
+      built-in backends loop over atomic `incr`s, the Redis backend runs one script).
+   5. If any rule was crossed for the first time (`count == limit + 1`) and `LOCKOUT` is
+      configured: one violation is counted; at the threshold the client is locked.
+   6. Store the `TrafficWatchState` on `request.trafficwatch`.
+   7. For each crossed rule: log, record, signal, callback (info carries `lockout`).
+   8. If any exceeded rule blocks (per-rule `BLOCK`, else global), the client is locked, or
+      the backend failed and `FAIL_OPEN` is `False`: return the block response with
+      `Retry-After` = the longest wait among blocking rules and the lockout. The view never
+      runs.
+
+   Steps 3–5 run inside one `try`: any exception from the cache produces a *degraded* state
+   (no results, `degraded=True`), logged at most once per `FAIL_OPEN_LOG_INTERVAL`. Exceptions
+   from a `KEY_FUNC` are not caught; they are bugs in the host project.
 
 `process_view` stays synchronous because Django's cache API is synchronous; Django wraps it
 with `sync_to_async` in an async stack. The response pass is native in both modes.
@@ -75,11 +95,15 @@ with `sync_to_async` in an async stack. The response pass is native in both mode
 
 ## Client identity and proxies
 
-`client_ip()` returns `REMOTE_ADDR` unless it belongs to `TRUSTED_PROXIES`. Only then is
-`X-Forwarded-For` read, walking from the rightmost hop (closest to us) leftwards and
+`resolve_client_ip()` returns `REMOTE_ADDR` unless it belongs to `TRUSTED_PROXIES`. Only then
+is `X-Forwarded-For` read, walking from the rightmost hop (closest to us) leftwards and
 returning the first hop that is *not* a trusted proxy. A client that sends
 `X-Forwarded-For: 1.2.3.4` through a trusted proxy ends up with `1.2.3.4, <real-ip>` and is
-keyed on `<real-ip>`.
+keyed on `<real-ip>`. `EXEMPT_CLIENTS` is matched against this resolved address.
+
+`client_ip()` additionally collapses IPv6 addresses to their `IPV6_PREFIX` network
+(`2001:db8:1:2::/64`), IPv4-mapped addresses to the IPv4, and leaves IPv4 alone, so a
+subscriber rotating through its /64 keeps one counter.
 
 Identifiers are passed through `safe_key_part()` before reaching the cache: anything with
 whitespace / control characters or longer than 120 chars is replaced by a SHA-256 prefix, so
@@ -88,11 +112,57 @@ custom `KEY_FUNC`s cannot produce keys Memcached rejects.
 ## Cache key layout
 
 ```
-{PREFIX}:{fw|sw}:{rule_name}:{client}:{bucket}
-{PREFIX}:recent                                   (list of recent violation dicts)
+{PREFIX}:{fw|sw}:{rule_name}:{client}:{bucket}    fixed / sliding counters (Django cache keys)
+{PREFIX}:rl:{{client}}:{rule_name}:{bucket}        redis backend (raw keys, hash-tagged by client)
+{PREFIX}:viol:{client}:{bucket}                   lockout violation counter (fixed window)
+{PREFIX}:lock:{client}                            active lockout, value = expiry timestamp
+{PREFIX}:recent                                   list of recent violation dicts
 ```
 - `rule_name` isolates buckets so `/api/login/` and the global rule don't share counts.
 - `bucket = int(now // window)` makes keys self-expiring; TTL = window (+1 window for sliding).
+- Clients and rule names pass through `safe_key_part()` first.
+
+## Escalating lockout
+
+`LOCKOUT = {"VIOLATIONS": N, "WINDOW_SECONDS": W, "DURATION_SECONDS": D}`. A *violation* is a
+request that crosses at least one rule for the first time in that rule's window (the same
+event that fires the signal), counted once per request in a fixed window of `W` seconds keyed
+on the global `KEY_FUNC` identity. When the counter reaches `N` (`>=`, so a client that keeps
+violating after the lock expires is re-locked immediately) a `lock` key with TTL `D` is
+written. Locked clients get the block response with `Retry-After` = remaining lock time and
+no counters are touched, so they cannot keep themselves locked by retrying; the lock simply
+expires. `request.trafficwatch.lockout` and `info["lockout"]` expose
+`violations / threshold / locked_until / active`.
+
+## Fail-open
+
+Every backend call in `check()` is wrapped. On an exception the request gets a
+`TrafficWatchState(results=(), degraded=True)`: `blocked` is `False` with `FAIL_OPEN=True`
+(default) and `True` otherwise (`Retry-After` = the smallest window among the rules). The
+outage is logged with the traceback at `ERROR`, rate limited to one record per
+`FAIL_OPEN_LOG_INTERVAL` seconds process-wide. `stats.record_violation` is wrapped separately
+so a flapping cache cannot break a request that was counted successfully.
+
+## Redis backend
+
+`RedisLuaBackend` obtains the redis-py client behind Django's `RedisCache`
+(`cache._cache.get_client(None, write=True)`) or `django-redis` (`cache.client.get_client`).
+`hit_many` groups the specs by client and runs one `EVALSHA` per client: the script `INCR`s
+each current bucket (setting the TTL on creation) and `GET`s each previous bucket, returning
+all counts. Python then applies `two_bucket_result()`, the exact function the sliding backend
+uses, so semantics, tests and `Retry-After` are identical. Keys are hash-tagged with the client
+so Redis Cluster accepts the multi-key script. Lockout and the recent list keep using the
+Django cache API. When the cache is not Redis the constructor logs once and delegates
+everything to a `SlidingWindowBackend`.
+
+## Headers
+
+`HEADERS_STYLE="x-ratelimit"` emits the de-facto `X-RateLimit-Limit/Remaining/Reset` for the
+strictest rule (`Reset` as epoch seconds with `RESET_AS_EPOCH`). `"ietf"` emits
+`RateLimit-Policy` listing every applicable rule as `"name";q=limit;w=window` and `RateLimit`
+as `"name";r=remaining;t=seconds` for the strictest rule (or `"lockout";r=0;t=…` while locked),
+per draft-ietf-httpapi-ratelimit-headers; names are quoted as RFC 8941 strings. `"both"`
+emits all of them.
 
 ## Sliding window and `Retry-After`
 
@@ -114,8 +184,15 @@ class BaseBackend:
     def hit(client, rule, window, limit) -> HitResult
     def peek(client, rule, window, limit) -> HitResult | None   # optional, read-only
     def reset(client, rule, window) -> None
+    def hit_many(specs) -> list[HitResult]                     # default: loop over hit()
+    def peek_many(specs) -> list[HitResult] | None             # default: loop over peek()
+    # lockout, implemented on the plain cache API, overridable:
+    def count_violation(client, window) -> int
+    def lock(client, duration) -> float
+    def locked_until(client) -> float | None
+    def unlock(client) -> None
 ```
-Custom backends (e.g. Redis sorted-set true sliding log, or a DB-backed audit store) only
+Custom backends (e.g. a Redis sorted-set exact sliding log, or a DB-backed audit store) only
 need `hit`/`reset` and a dotted path in `TRAFFICWATCH["BACKEND"]`.
 
 ## Trade-offs
@@ -131,6 +208,13 @@ need `hit`/`reset` and a dotted path in `TRAFFICWATCH["BACKEND"]`.
 - The backend instance is created when the middleware is instantiated, so changing
   `BACKEND`, `CACHE_ALIAS` or `CACHE_PREFIX` needs a process restart. Everything else is
   read per request.
+- Lockout violations are keyed on the global `KEY_FUNC` identity even when the crossed rule
+  has its own `KEY_FUNC`; a per-rule key is usually a coarser or finer view of the same
+  client, and one lockout identity keeps the escalation predictable.
+- The Redis backend keeps the two-bucket estimate rather than an exact sorted-set log: the
+  log costs one member per request (unbounded under attack) and would either stop counting
+  blocked requests or keep a hammering client blocked forever. The estimate is bounded and
+  matches the other backends exactly.
 
 ## Release flow
 

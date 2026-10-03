@@ -9,6 +9,7 @@ audit log. For a durable record use the ``traffic_exceeded`` signal.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from django.core.cache import caches
 
@@ -17,7 +18,7 @@ from .conf import tw_settings
 RETENTION_SECONDS = 7 * 24 * 3600
 
 
-def _cache():
+def _cache() -> Any:
     return caches[tw_settings.CACHE_ALIAS]
 
 
@@ -25,7 +26,7 @@ def _key() -> str:
     return f"{tw_settings.CACHE_PREFIX}:recent"
 
 
-def record_violation(info: dict) -> None:
+def record_violation(info: dict[str, Any]) -> None:
     keep = int(tw_settings.RECENT_VIOLATIONS or 0)
     if keep <= 0:
         return
@@ -37,7 +38,7 @@ def record_violation(info: dict) -> None:
     cache.set(_key(), entries, timeout=RETENTION_SECONDS)
 
 
-def recent_violations(limit: int | None = None) -> list[dict]:
+def recent_violations(limit: int | None = None) -> list[dict[str, Any]]:
     """Most recent violations, newest first."""
     entries = list(_cache().get(_key()) or [])
     entries.reverse()
