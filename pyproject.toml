@@ -1,0 +1,72 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "django-trafficwatch"
+dynamic = ["version"]
+description = "Configurable traffic monitoring and rate-limiting middleware for Django (time window + request count, per-path/per-method rules, DRF throttle, alerts)."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{ name = "Aaron-lab-c" }]
+keywords = ["django", "middleware", "rate-limit", "throttle", "traffic", "monitoring", "drf"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: Django",
+  "Framework :: Django :: 4.2",
+  "Framework :: Django :: 5.2",
+  "Framework :: Django :: 6.0",
+  "Framework :: Django :: 6.1",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: WWW/HTTP :: WSGI :: Middleware",
+]
+dependencies = ["Django>=4.2"]
+
+[project.optional-dependencies]
+drf = ["djangorestframework>=3.14"]
+dev = [
+  "pytest>=8",
+  "pytest-django>=4.8",
+  "pytest-asyncio>=0.23",
+  "djangorestframework>=3.14",
+  "ruff>=0.5",
+  "build",
+  "twine",
+]
+
+[project.urls]
+Homepage = "https://github.com/Aaron-lab-c/django-trafficwatch"
+Issues = "https://github.com/Aaron-lab-c/django-trafficwatch/issues"
+Changelog = "https://github.com/Aaron-lab-c/django-trafficwatch/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/django_trafficwatch/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/django_trafficwatch"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.settings"
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+django_debug_mode = "keep"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
