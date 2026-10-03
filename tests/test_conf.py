@@ -11,6 +11,9 @@ def test_defaults_and_overrides(tw):
     assert tw_settings.BLOCK is True
     assert tw_settings.TRUSTED_PROXIES == []
     assert tw_settings.EXEMPT_METHODS == ["OPTIONS"]
+    from django_trafficwatch.conf import DEFAULTS
+
+    assert "/favicon.ico" in DEFAULTS["EXEMPT_PATHS"]  # tests/settings.py overrides the list
     tw(BLOCK=False)
     assert tw_settings.BLOCK is False
 
@@ -66,6 +69,7 @@ def test_lockout_is_parsed_and_cached(tw):
         ({"LOCKOUT": {"VIOLATIONS": 1}}, "LOCKOUT"),
         ({"HEADERS_STYLE": "nope"}, "HEADERS_STYLE"),
         ({"IPV6_PREFIX": 0}, "IPV6_PREFIX"),
+        ({"MAX_REQUEST": 5}, "unknown keys \\['MAX_REQUEST'\\]"),
     ],
 )
 def test_validate_fails_fast(tw, bad, message):

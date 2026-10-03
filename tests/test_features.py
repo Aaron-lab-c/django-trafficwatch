@@ -138,6 +138,39 @@ def test_404s_respect_exemptions_and_path_rules(client, tw):
         assert exempt.get("/zzz/").status_code == 404
 
 
+def test_missing_favicon_is_not_charged_by_default(tw):
+    """Browsers request /favicon.ico on their own; a 404 for it must not eat the quota."""
+    tw(EXEMPT_PATHS=["/static/", "/media/", "/favicon.ico"])  # the shipped default
+    c = Client(REMOTE_ADDR="8.8.8.9")
+    for _ in range(10):
+        r = c.get("/favicon.ico")
+        assert r.status_code == 404 and "X-RateLimit-Limit" not in r
+    assert c.get("/").status_code == 200
+
+
+def test_append_slash_redirect_is_counted(settings):
+    """CommonMiddleware above ours: Django produces the 404 first and only converts it to a
+    301 on the way out, so the request has already been counted (and is blocked instead of
+    redirected once the client is over)."""
+    settings.MIDDLEWARE = [
+        "django.middleware.common.CommonMiddleware",
+        "django_trafficwatch.middleware.TrafficWatchMiddleware",
+    ]
+    settings.APPEND_SLASH = True
+    c = fresh_client(REMOTE_ADDR="8.8.8.10")
+    for _ in range(3):
+        # Exists only with a trailing slash. The 301 is a fresh response built by
+        # CommonMiddleware, so it carries no X-RateLimit-* headers, but it was counted.
+        assert c.get("/api/login").status_code == 301
+    assert c.get("/api/login").status_code == 429
+
+
+def test_unknown_top_level_key_fails_at_startup(tw):
+    tw(MAX_REQUEST=5)  # typo: missing S
+    with pytest.raises(ImproperlyConfigured, match="MAX_REQUEST"):
+        fresh_client()
+
+
 def test_count_unrouted_can_be_disabled(client, tw):
     tw(COUNT_UNROUTED=False)
     for _ in range(10):

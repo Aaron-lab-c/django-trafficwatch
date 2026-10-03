@@ -39,3 +39,14 @@ def test_recent_command_clear(client):
     out = StringIO()
     call_command("trafficwatch_recent", stdout=out)
     assert "No violations recorded." in out.getvalue()
+
+
+def test_recent_command_explains_locmem(settings):
+    if "locmem" not in settings.CACHES["default"]["BACKEND"].lower():
+        import pytest
+
+        pytest.skip("suite is running against Redis")
+    out, err = StringIO(), StringIO()
+    call_command("trafficwatch_recent", stdout=out, stderr=err)
+    assert "No violations recorded." in out.getvalue()
+    assert "LocMemCache" in err.getvalue() and "own process" in err.getvalue()

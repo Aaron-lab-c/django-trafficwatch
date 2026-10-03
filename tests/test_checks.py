@@ -6,16 +6,19 @@ from django_trafficwatch.checks import check_trafficwatch_settings
 
 
 def ids(errors):
-    return sorted(e.id for e in errors)
+    """Ids of everything above INFO (the LocMem I001 info is tested on its own)."""
+    return sorted(e.id for e in errors if e.level > 20)
 
 
 def test_clean_settings_pass(settings):
-    assert check_trafficwatch_settings(None) == []
+    assert ids(check_trafficwatch_settings(None)) == []
 
 
-def test_unknown_key_warns(tw):
-    tw(TYPO=1)
-    assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.W001"]
+def test_unknown_key_errors(tw):
+    tw(MAX_REQUEST=1)
+    found = check_trafficwatch_settings(None)
+    assert ids(found) == ["trafficwatch.E016"]
+    assert "MAX_REQUEST" in found[0].msg and "MAX_REQUESTS" in (found[0].hint or "")
 
 
 def test_bad_path_rules_error(tw):
@@ -56,6 +59,15 @@ def test_locmem_in_production_warns(settings):
     assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.W002"]
 
 
+@locmem_only
+def test_locmem_in_debug_is_an_info(settings):
+    settings.DEBUG = True
+    found = check_trafficwatch_settings(None)
+    assert [m.id for m in found] == ["trafficwatch.I001"]
+    assert found[0].level == 20  # INFO: visible, never fails `check`
+    assert "trafficwatch_recent" in found[0].msg
+
+
 def test_middleware_missing_warns(settings):
     settings.MIDDLEWARE = []
     assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.W003"]
@@ -68,7 +80,7 @@ def test_middleware_before_auth_warns(settings):
     ]
     assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.W004"]
     settings.MIDDLEWARE = list(reversed(settings.MIDDLEWARE))
-    assert check_trafficwatch_settings(None) == []
+    assert ids(check_trafficwatch_settings(None)) == []
 
 
 def test_manage_check_runs_registered_check(tw):
@@ -109,7 +121,7 @@ def test_bad_lockout_error(tw, lockout):
 
 def test_good_lockout_passes(tw):
     tw(LOCKOUT={"VIOLATIONS": 3, "WINDOW_SECONDS": 60, "DURATION_SECONDS": 60})
-    assert check_trafficwatch_settings(None) == []
+    assert ids(check_trafficwatch_settings(None)) == []
 
 
 def test_bad_headers_style_error(tw):
@@ -126,7 +138,8 @@ def test_fail_closed_warns(tw):
     tw(FAIL_OPEN=False)
     found = check_trafficwatch_settings(None)
     assert ids(found) == ["trafficwatch.W005"]
-    assert "degraded" in found[0].hint
+    (w005,) = [m for m in found if m.id == "trafficwatch.W005"]
+    assert "degraded" in w005.hint
 
 
 @locmem_only
@@ -137,7 +150,7 @@ def test_redis_backend_on_non_redis_cache_warns(tw):
 
 def test_log_interval_zero_is_allowed(tw):
     tw(FAIL_OPEN_LOG_INTERVAL=0)
-    assert check_trafficwatch_settings(None) == []
+    assert ids(check_trafficwatch_settings(None)) == []
     tw(FAIL_OPEN_LOG_INTERVAL=-1)
     assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E002"]
 

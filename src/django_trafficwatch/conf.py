@@ -43,7 +43,9 @@ DEFAULTS: dict[str, Any] = {
     # instead of request.path. Useful when the project is mounted under a URL prefix.
     "MATCH_PATH_INFO": False,
     # Path prefixes that are never counted.
-    "EXEMPT_PATHS": ["/static/", "/media/"],
+    # /favicon.ico is included because browsers request it on their own and a missing one
+    # would otherwise charge a 404 to the visitor's global quota (COUNT_UNROUTED).
+    "EXEMPT_PATHS": ["/static/", "/media/", "/favicon.ico"],
     # HTTP methods that are never counted (CORS preflight, health probes).
     "EXEMPT_METHODS": ["OPTIONS"],
     # Client IPs / CIDR networks that are never counted (matched against the resolved
@@ -217,6 +219,9 @@ class TrafficWatchSettings:
         Raises ``ImproperlyConfigured``. ``manage.py check`` reports the same problems
         (and more) with ids instead of raising."""
         problems = []
+        unknown = sorted(set(self._user()) - set(DEFAULTS))
+        if unknown:
+            problems.append(f"unknown keys {unknown} (did you mean one of {sorted(DEFAULTS)}?)")
         for name in ("WINDOW_SECONDS", "MAX_REQUESTS"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:

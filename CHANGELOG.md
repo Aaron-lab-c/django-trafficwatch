@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.0 — unreleased
+
+### Changed
+- **Unknown top-level `TRAFFICWATCH` keys refuse to start.** A typo such as `MAX_REQUEST` used
+  to produce only `W001` while the middleware ran with the default value; it now raises
+  `ImproperlyConfigured` at startup and `manage.py check` reports `E016`, consistent with
+  unknown keys inside a rule.
+- **`/favicon.ico` is in the default `EXEMPT_PATHS`.** With `COUNT_UNROUTED` a missing favicon
+  was charged to the visitor's global quota. Projects overriding `EXEMPT_PATHS` should add it.
+- `LocMemCache` is now reported under `DEBUG=True` too, as `Info` (`I001`); `W002` is unchanged
+  for `DEBUG=False`. `trafficwatch_recent` explains why it sees nothing on LocMem.
+
+### Fixed
+- README: `CommonMiddleware`'s `APPEND_SLASH` redirect *is* counted (Django turns the 404 into
+  a 301 only in the response phase); the earlier text claimed the opposite. The 404 side
+  effect of `COUNT_UNROUTED` on browser-initiated requests is documented.
+
+### Removed
+- `trafficwatch.W001` (replaced by `E016`).
+
 ## 0.4.0 — unreleased
 
 Fixes from a load / behaviour test of 0.3.0.
