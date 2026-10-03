@@ -247,6 +247,16 @@ need `hit`/`reset` and a dotted path in `TRAFFICWATCH["BACKEND"]`.
   blocked requests or keep a hammering client blocked forever. The estimate is bounded and
   matches the other backends exactly.
 
+## Test layout
+
+- `tests/`: unit and integration tests against the source tree, with frozen time, direct
+  backend access and internal helpers. Fast and exhaustive.
+- `acceptance/`: black-box tests from the package user's point of view: a real project
+  (`acceptance/project/`) configured per the README, driven through HTTP with real time
+  (2-second global window) and only public API. CI runs it against the built wheel from a
+  directory outside the repo, on LocMem and on Redis. Add a scenario here whenever a
+  README promise changes.
+
 ## Release flow
 
 ```

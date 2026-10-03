@@ -15,7 +15,7 @@ jobs:
           python-version: "3.12"
       - run: pip install ruff
       - run: ruff check .
-      - run: ruff format --check src tests
+      - run: ruff format --check src tests acceptance
 
   typecheck:
     runs-on: ubuntu-latest
@@ -84,3 +84,40 @@ jobs:
           python-version: "3.12"
       - run: pip install "Django~=${{ matrix.django-version }}.0" -e ".[dev]"
       - run: pytest -q
+
+  # The user's view: build the wheel, install it in a clean environment, copy only the
+  # acceptance project out of the repo (so src/ is not importable) and drive the package
+  # through HTTP exactly as the README describes. Catches packaging mistakes as well as
+  # behaviour regressions.
+  acceptance:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build && python -m build --wheel
+      - run: |
+          python -m venv /tmp/acc-venv
+          /tmp/acc-venv/bin/pip install dist/*.whl pytest pytest-django pytest-asyncio djangorestframework redis
+          mkdir /tmp/acc && cp -r acceptance /tmp/acc/
+      - name: Acceptance suite against the installed wheel (LocMem)
+        working-directory: /tmp/acc
+        env:
+          TW_ACCEPTANCE_INSTALLED: "1"
+        run: /tmp/acc-venv/bin/python -m pytest -c acceptance/pytest.ini acceptance -q
+      - name: Acceptance suite against the installed wheel (Redis)
+        working-directory: /tmp/acc
+        env:
+          TW_ACCEPTANCE_INSTALLED: "1"
+          TW_REDIS_URL: redis://localhost:6379/2
+        run: /tmp/acc-venv/bin/python -m pytest -c acceptance/pytest.ini acceptance -q

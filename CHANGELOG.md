@@ -17,6 +17,10 @@
   a 301 only in the response phase); the earlier text claimed the opposite. The 404 side
   effect of `COUNT_UNROUTED` on browser-initiated requests is documented.
 
+### Added
+- `acceptance/`: a black-box acceptance suite (a README-configured project driven through
+  HTTP) that CI runs against the built wheel, on LocMem and on Redis.
+
 ### Removed
 - `trafficwatch.W001` (replaced by `E016`).
 

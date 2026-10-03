@@ -331,10 +331,23 @@ TRAFFICWATCH = {"BLOCK_RESPONSE": "myproject.views.too_many", ...}
 
 ```bash
 pip install -e ".[dev,typing]"
-pytest                                        # LocMem
+pytest                                        # unit suite, LocMem
 TW_REDIS_URL=redis://localhost:6379/1 pytest  # the same suite against Redis + Redis-only tests
-ruff check . && ruff format --check src tests
+pytest -c acceptance/pytest.ini               # acceptance suite (see below)
+ruff check . && ruff format --check src tests acceptance
 mypy --strict src
+```
+
+`acceptance/` is a stand-alone Django project configured the way this README recommends. Its
+tests drive the package only through settings, public decorators and HTTP, one scenario per
+documented feature (limits, rules, identity, exemptions, alerts, inspection, outage, lockout,
+unrouted requests, DRF, ASGI, configuration errors). CI builds the wheel, installs it in a
+clean environment and runs that suite from outside the repository, so a packaging mistake
+fails the build too. Run it yourself against an installed release with:
+
+```bash
+cp -r acceptance /tmp/acc && cd /tmp/acc && pip install django-trafficwatch pytest pytest-django pytest-asyncio djangorestframework
+pytest -c acceptance/pytest.ini acceptance
 ```
 
 ## Release
