@@ -76,9 +76,10 @@ def test_sliding_reset_in_is_time_until_next_accepted_request(frozen):
     results = [b.hit("c", "*", 10, 5) for _ in range(6)]
     blocked = results[-1]
     assert blocked.exceeded
-    # Current bucket is full (6 > 5) so we must wait for the roll-over, then until
-    # 6 * (1 - e) + 1 <= 5  ->  e >= 1/3  ->  ~3.34s into the next bucket.
-    assert blocked.reset_in == 14
+    # The rejected 6th request is rolled back, so 5 stay stored. We must wait for the
+    # roll-over, then until 5 * (1 - e) + 1 <= 5  ->  e >= 0.2  ->  2s into the next bucket.
+    assert blocked.reset_in == 12
+    assert b.peek("c", "*", 10, 5).count == 5  # the rejected request was not counted
     frozen["t"] = 1000.0 + blocked.reset_in
     assert not b.hit("c", "*", 10, 5).exceeded
 
@@ -116,9 +117,46 @@ def test_hit_many_and_peek_many(frozen, backend_cls):
     for _ in range(3):
         results = b.hit_many(specs)
     assert [r.count for r in results] == [3, 3]
-    assert results[0].exceeded and not results[1].exceeded
-    assert [p.count for p in b.peek_many(specs)] == [3, 3]
+    assert results[0].exceeded and results[0].just_exceeded and not results[1].exceeded
+    # The 3rd request was rejected by rule "a": neither rule keeps it (rollback).
+    assert [p.count for p in b.peek_many(specs)] == [2, 2]
+    again = b.hit_many(specs)
+    assert again[0].exceeded and not again[0].just_exceeded  # notified once per window
     assert b.hit_many([]) == [] and b.peek_many([]) == []
+
+
+@pytest.mark.parametrize("backend_cls", [FixedWindowBackend, SlidingWindowBackend])
+def test_observe_only_rules_keep_counting(frozen, backend_cls):
+    """A rule with enforce=False (BLOCK=False) never rejects, so nothing is rolled back and
+    its counter keeps growing past the limit."""
+    b = backend_cls("default", "t")
+    for _ in range(5):
+        last = b.hit_many([("c", "obs", 10, 2, False)])[0]
+    assert last.count == 5 and last.exceeded
+    assert b.peek("c", "obs", 10, 2).count == 5
+
+
+@pytest.mark.parametrize("backend_cls", [FixedWindowBackend, SlidingWindowBackend])
+def test_slightly_over_the_limit_client_is_not_starved(frozen, backend_cls):
+    """11 evenly spaced requests per minute against 10/min must get ~10 through, not 0."""
+    b = backend_cls("default", "t")
+    accepted = 0
+    for i in range(11 * 5):  # five minutes
+        frozen["t"] = 1000.0 + i * (60 / 11)
+        if not b.hit("c", "*", 60, 10).exceeded:
+            accepted += 1
+    assert accepted >= 45, accepted  # fixed: 50, sliding: a little under due to the estimate
+
+
+def test_fixed_window_retry_after_rounds_up(frozen):
+    """Retry-After must be honest: waiting exactly that long lands in the next bucket."""
+    b = FixedWindowBackend("default", "t")
+    frozen["t"] = 1000.4
+    for _ in range(3):
+        last = b.hit("c", "*", 10, 2)
+    assert last.exceeded and last.reset_in == 10  # 9.6s rounded up, not down to 9
+    frozen["t"] += last.reset_in
+    assert not b.hit("c", "*", 10, 2).exceeded
 
 
 def test_lockout_helpers(frozen):
@@ -156,8 +194,9 @@ def test_redis_lua_backend_falls_back_on_non_redis_cache(frozen, caplog, setting
     for _ in range(3):
         last = b.hit("c", "*", 10, 2)
     assert last.count == 3 and last.exceeded
-    assert b.peek("c", "*", 10, 2).count == 3
-    assert [r.count for r in b.hit_many([("c", "*", 10, 2), ("c", "x", 10, 2)])] == [4, 1]
+    assert b.peek("c", "*", 10, 2).count == 2  # rejected request rolled back
+    assert [r.count for r in b.hit_many([("c", "*", 10, 2), ("c", "x", 10, 2)])] == [3, 1]
+    assert b.peek("c", "x", 10, 2).count == 0  # rolled back with the rejected request
     b.reset("c", "*", 10)
     assert b.hit("c", "*", 10, 2).count == 1
 

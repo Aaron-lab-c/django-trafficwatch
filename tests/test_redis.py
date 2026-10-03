@@ -55,11 +55,12 @@ def test_redis_lua_single_round_trip(frozen):
     assert [r.count for r in results] == [5, 5]
     r = b.hit_many(specs)
     assert r[0].exceeded and r[0].just_exceeded and not r[1].exceeded
-    assert b.peek_many(specs) is not None
-    assert [p.count for p in b.peek_many(specs)] == [6, 6]
+    assert [p.count for p in b.peek_many(specs)] == [5, 5]  # rejected -> rolled back
+    r = b.hit_many(specs)
+    assert r[0].exceeded and not r[0].just_exceeded  # marker: notified once
     # previous bucket decays like the sliding estimate
     frozen["t"] = 1015.0
-    assert b.hit("c", "a", 10, 5).count == int(6 * 0.5 + 1)
+    assert b.hit("c", "a", 10, 5).count == int(5 * 0.5 + 1)
     b.reset("c", "a", 10)
     assert b.hit("c", "a", 10, 5).count == 1
 

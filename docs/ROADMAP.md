@@ -22,6 +22,14 @@ README/ARCHITECTURE updates. Run the suite with `pytest` (and
 - P3.12 `MATCH_PATH_INFO`.
 - P3.13 `py.typed` shipped, `mypy --strict src` in CI.
 
+## Done in 0.4.0 (behaviour test follow-ups)
+
+- Rejected requests are rolled back (no sliding-window starvation, no cross-rule quota loss).
+- `Retry-After` rounds up; once-per-window notification via an atomic marker.
+- `COUNT_UNROUTED`: 404s and early-middleware responses are counted.
+- Numeric / boolean settings validated at startup; `W007` / `E014` for non-atomic or dummy
+  caches; raising `KEY_FUNC` / `EXEMPT_FUNC` degrade instead of 500.
+
 ## Open
 
 1. **Exact sliding log for Redis.** An optional `"redis-log"` mode using a sorted set per
@@ -35,7 +43,10 @@ README/ARCHITECTURE updates. Run the suite with `pytest` (and
    crossing's `traffic_exceeded` payload as `info["lockout"]`).
 4. **Per-rule lockout identity.** Allow `LOCKOUT["KEY_FUNC"]` for projects whose rules key on
    API keys rather than users / IPs.
-5. (Low value) native async `process_view` using the cache `a*` API; Django's cache backends
+5. **Admission for third-party backends.** Let a `hit()`-only backend opt into rollback by
+   implementing `uncount()`, so custom stores get the "rejected requests are not counted"
+   semantics too.
+6. (Low value) native async `process_view` using the cache `a*` API; Django's cache backends
    are sync underneath, so measure before merging.
 
 ## Non-goals for now

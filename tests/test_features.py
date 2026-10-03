@@ -28,7 +28,7 @@ class BrokenBackend(FixedWindowBackend):
 @pytest.fixture
 def broken(tw):
     tw(BACKEND="tests.test_features.BrokenBackend")
-    core._outage_logged_at = 0.0
+    core._reset_log_throttle()
     return fresh_client(REMOTE_ADDR="7.7.7.7")
 
 
@@ -83,13 +83,145 @@ def test_fail_closed_custom_response_gets_degraded_info(broken, tw):
     assert seen["degraded"] is True and seen["rule"] is None and seen["client"] == "ip:7.7.7.7"
 
 
-def test_key_func_errors_are_not_swallowed(client, tw):
+def test_broken_key_func_falls_back_to_ip(client, tw, caplog):
+    """A raising KEY_FUNC must not 500 the site: log it, key on the IP, keep limiting."""
+
     def boom(request):
         raise RuntimeError("bad key func")
 
     tw(KEY_FUNC=boom)
-    with pytest.raises(RuntimeError):
+    core._reset_log_throttle()
+    with caplog.at_level(logging.ERROR, logger="django_trafficwatch"):
+        for _ in range(3):
+            assert client.get("/state/").status_code == 200
+        r = client.get("/")
+    assert r.status_code == 429
+    assert sum("KEY_FUNC" in rec.getMessage() for rec in caplog.records) == 1
+    assert Client(REMOTE_ADDR="2.2.2.2").get("/").status_code == 200  # keyed per IP
+
+
+def test_broken_exempt_func_does_not_exempt(client, tw, caplog):
+    def boom(request):
+        raise RuntimeError("bad exempt func")
+
+    tw(EXEMPT_FUNC=boom)
+    core._reset_log_throttle()
+    with caplog.at_level(logging.ERROR, logger="django_trafficwatch"):
+        for _ in range(3):
+            assert client.get("/").status_code == 200
+        assert client.get("/").status_code == 429
+    assert sum("EXEMPT_FUNC" in rec.getMessage() for rec in caplog.records) == 1
+
+
+# -- unrouted requests (404s, early-middleware responses) -----------------------------
+
+
+def test_404s_are_counted_and_blocked(client):
+    for i in range(3):
+        r = client.get(f"/does-not-exist-{i}/")
+        assert r.status_code == 404
+        assert r["X-RateLimit-Remaining"] == str(2 - i)
+    r = client.get("/does-not-exist-99/")
+    assert r.status_code == 429 and "Retry-After" in r
+    assert client.get("/").status_code == 429  # same global bucket as real views
+
+
+def test_404s_respect_exemptions_and_path_rules(client, tw):
+    tw(PATH_RULES={"/api/": {"MAX_REQUESTS": 1, "NAME": "api"}}, EXEMPT_CLIENTS=["9.9.9.9"])
+    assert client.get("/api/nope/").status_code == 404
+    assert client.get("/api/nope2/").status_code == 429
+    assert client.get("/health/nope/").status_code == 404  # EXEMPT_PATHS prefix
+    exempt = Client(REMOTE_ADDR="9.9.9.9")
+    for _ in range(5):
+        assert exempt.get("/zzz/").status_code == 404
+
+
+def test_count_unrouted_can_be_disabled(client, tw):
+    tw(COUNT_UNROUTED=False)
+    for _ in range(10):
+        r = client.get("/does-not-exist/")
+        assert r.status_code == 404 and "X-RateLimit-Limit" not in r
+    assert client.get("/").status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_404s_are_counted_under_asgi():
+    from django.test import AsyncClient
+
+    c = AsyncClient(REMOTE_ADDR="4.4.4.5")
+    for _ in range(3):
+        assert (await c.get("/missing/")).status_code == 404
+    assert (await c.get("/missing/")).status_code == 429
+
+
+def test_early_middleware_response_is_counted(tw, settings):
+    """A response produced by a middleware *below* ours (so our __call__ still runs but
+    process_view never does) is counted too."""
+    settings.MIDDLEWARE = [
+        "django_trafficwatch.middleware.TrafficWatchMiddleware",
+        "tests.test_features.ShortCircuitMiddleware",
+    ]
+    c = fresh_client(REMOTE_ADDR="8.8.4.4")
+    for _ in range(3):
+        assert c.get("/").status_code == 418
+    assert c.get("/").status_code == 429
+
+
+class ShortCircuitMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        from django.http import HttpResponse
+
+        return HttpResponse("teapot", status=418)
+
+
+# -- rejected requests do not consume quota ---------------------------------------
+
+
+def test_blocked_request_does_not_consume_other_rules(client, frozen):
+    """stacked_view: 2/min and 3/hour. The 3rd request is rejected by the minute rule and
+    must not use up the hourly quota."""
+    for _ in range(2):
+        assert client.get("/decorated/stacked/").status_code == 200
+    for _ in range(5):
+        assert client.get("/decorated/stacked/").status_code == 429
+    frozen["t"] = 1000.0 + 60  # next minute: hourly still has 1 left
+    r = client.get("/decorated/stacked/")
+    assert r.status_code == 200
+    assert client.get("/decorated/stacked/").status_code == 429  # hourly (3) now exhausted
+    assert client.get("/decorated/stacked/")["X-RateLimit-Limit"] == "3"
+
+
+def test_retrying_client_gets_served_after_retry_after(client, frozen):
+    for _ in range(3):
         client.get("/")
+    r = client.get("/")
+    assert r.status_code == 429
+    frozen["t"] += int(r["Retry-After"])
+    assert client.get("/").status_code == 200
+
+
+def test_notification_fires_once_even_when_hammering(client, tw):
+    calls = []
+    tw(ON_EXCEEDED=lambda req, info: calls.append(info))
+    for _ in range(20):
+        client.get("/")
+    assert len(calls) == 1 and calls[0]["count"] == 4
+
+
+# -- bad numeric configuration fails fast ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"MAX_REQUESTS": 0}, {"MAX_REQUESTS": -1}, {"WINDOW_SECONDS": "60"}, {"BLOCK_STATUS": 42}],
+)
+def test_bad_numbers_fail_at_startup(tw, bad):
+    tw(**bad)
+    with pytest.raises(ImproperlyConfigured):
+        fresh_client()
 
 
 # -- exemptions ----------------------------------------------------------------------

@@ -35,6 +35,10 @@ DEFAULTS: dict[str, Any] = {
     # Per-path rules overriding the global one. See rules.py for the full format.
     # {"/api/login/": {"WINDOW_SECONDS": 300, "MAX_REQUESTS": 5, "METHODS": ["POST"]}}
     "PATH_RULES": {},
+    # Also count requests that never reach a view: 404s from the URL resolver and responses
+    # produced by middleware above this one (redirects, CSRF failures). They are matched
+    # against PATH_RULES / the global rule. False restores the pre-0.4 behaviour.
+    "COUNT_UNROUTED": True,
     # Match EXEMPT_PATHS / PATH_RULES against request.path_info (path without SCRIPT_NAME)
     # instead of request.path. Useful when the project is mounted under a URL prefix.
     "MATCH_PATH_INFO": False,
@@ -90,6 +94,15 @@ DEFAULTS: dict[str, Any] = {
 }
 
 _IMPORTABLE = {"KEY_FUNC", "ON_EXCEEDED", "BLOCK_RESPONSE", "EXEMPT_FUNC"}
+
+BOOLEAN_SETTINGS = (
+    "BLOCK",
+    "HEADERS",
+    "FAIL_OPEN",
+    "RESET_AS_EPOCH",
+    "MATCH_PATH_INFO",
+    "COUNT_UNROUTED",
+)
 
 _LOCKOUT_KEYS = {"VIOLATIONS", "WINDOW_SECONDS", "DURATION_SECONDS"}
 
@@ -204,6 +217,24 @@ class TrafficWatchSettings:
         Raises ``ImproperlyConfigured``. ``manage.py check`` reports the same problems
         (and more) with ids instead of raising."""
         problems = []
+        for name in ("WINDOW_SECONDS", "MAX_REQUESTS"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                problems.append(f"{name} must be a positive integer, got {value!r}")
+        status = self.BLOCK_STATUS
+        if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+            problems.append(f"BLOCK_STATUS must be an HTTP status code, got {status!r}")
+        for name in ("RECENT_VIOLATIONS", "FAIL_OPEN_LOG_INTERVAL"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                problems.append(f"{name} must be a non-negative integer, got {value!r}")
+        for name in BOOLEAN_SETTINGS:
+            if not isinstance(getattr(self, name), bool):
+                problems.append(f"{name} must be a boolean")
+        for name in ("EXEMPT_PATHS", "EXEMPT_METHODS"):
+            value = getattr(self, name)
+            if isinstance(value, str) or not all(isinstance(p, str) for p in value):
+                problems.append(f"{name} must be a list of strings")
         try:
             _ = self.ruleset
         except (RuleConfigError, ImportError, TypeError) as exc:

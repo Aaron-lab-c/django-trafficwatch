@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+Fixes from a load / behaviour test of 0.3.0.
+
+### Changed (behaviour)
+- **Rejected requests are no longer counted.** All built-in backends increment every rule,
+  then roll the increments back when an enforced rule is over. Previously the sliding window
+  counted its own rejections, so a client slightly over the limit (11/min against 10/min)
+  pushed its estimate up with every retry and was starved almost completely; it now gets 10
+  through. A request blocked by one rule no longer consumes the quota of the others (e.g. the
+  daily rule). Observe-only rules (`BLOCK=False`) still count everything.
+- **`Retry-After` / `X-RateLimit-Reset` round up** instead of down; waiting exactly that long
+  is always enough (the fixed window was 1 s short).
+- **Once-per-window notifications use an atomic marker** (`HitResult.first`) instead of
+  `count == limit + 1`, so the signal / `ON_EXCEEDED` fire exactly once even when the sliding
+  estimate jumps over `limit + 1` or a client hammers.
+- **Unrouted requests are counted** (`COUNT_UNROUTED`, default `True`): 404s from the URL
+  resolver and responses from middleware below `TrafficWatchMiddleware` are matched against
+  `PATH_RULES` / the global rule and can be blocked. Previously a scanner hitting unknown URLs
+  was never counted. Set `COUNT_UNROUTED = False` for the old behaviour.
+- **A raising `KEY_FUNC` / `EXEMPT_FUNC` no longer 500s the request**: logged at `ERROR`
+  (throttled like the cache-outage log); the key func falls back to the client IP, the exempt
+  func exempts nothing.
+
+### Added
+- Startup validation (`ImproperlyConfigured`) and `manage.py check` now cover
+  `WINDOW_SECONDS` / `MAX_REQUESTS` (0 or negative used to start fine and block everything),
+  `BLOCK_STATUS`, `RECENT_VIOLATIONS`, `FAIL_OPEN_LOG_INTERVAL`, the boolean flags and the
+  exempt lists (`E002`, `E013`, `E015`).
+- `trafficwatch.W007`: `FileBasedCache` / `DatabaseCache` have a non-atomic `incr` and lose
+  counts under concurrency. `trafficwatch.E014`: `DummyCache` never limits anything.
+- `HitSpec` may carry a 5th element `enforce`; `BaseBackend.first_crossing()` and `_decr()`
+  helpers for custom backends.
+
+### Removed
+- Nothing. `HitResult.just_exceeded` still works for backends that do not set `first`.
+
 ## 0.3.0 — unreleased
 
 ### Security / production safety

@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import Any, Union
 
 from django.core.cache import caches
 
 
 @dataclass(frozen=True)
 class HitResult:
-    count: int  # requests seen in the current window, including this one
+    count: int  # requests attempted in the current window, including this one
     limit: int
     reset_in: int  # seconds until the client may send another request / gets a fresh window
+    first: bool | None = None  # True on the first rejection of this window (see below)
 
     @property
     def remaining(self) -> int:
@@ -24,24 +26,48 @@ class HitResult:
 
     @property
     def just_exceeded(self) -> bool:
-        """True only for the first request that crosses the limit."""
+        """True only once per window: the first request that is turned away. Backends set
+        ``first`` from an atomic marker; a backend that does not is approximated by
+        ``count == limit + 1``."""
+        if self.first is not None:
+            return self.first
         return self.count == self.limit + 1
 
 
-# (client, rule, window, limit) as handed to ``hit_many`` / ``peek_many``.
-HitSpec = tuple[str, str, int, int]
+# (client, rule, window, limit[, enforce]) as handed to ``hit_many`` / ``peek_many``.
+# ``enforce`` (default True) says whether exceeding this rule rejects the request; rules in
+# observe-only mode pass False so their counters keep counting served requests.
+HitSpec = Union[tuple[str, str, int, int], tuple[str, str, int, int, bool]]
+
+
+def spec_parts(spec: HitSpec) -> tuple[str, str, int, int, bool]:
+    client, rule, window, limit = spec[0], spec[1], spec[2], spec[3]
+    enforce = bool(spec[4]) if len(spec) > 4 else True
+    return client, rule, window, limit, enforce
+
+
+def ceil_seconds(seconds: float) -> int:
+    """``Retry-After`` must never be short: round up and never report 0."""
+    return max(math.ceil(seconds), 1)
 
 
 class BaseBackend:
     """Contract for counters. Implementations must be safe to call concurrently from many
-    processes; the built-in ones only use atomic cache ``incr``.
+    processes; the built-in ones only use atomic cache ``incr`` / ``decr`` / ``add``.
+
+    Semantics of the built-in backends: **rejected requests are not counted**. A request is
+    counted against every rule first; if any *enforced* rule is exceeded the increments are
+    rolled back, so a client that keeps retrying does not starve itself and a request blocked
+    by one rule does not consume the quota of the others. The reported ``count`` still
+    includes the attempt (``limit + 1`` when turned away) so ``exceeded`` / ``remaining`` read
+    naturally. ``HitResult.first`` is set from an atomic one-per-window marker.
 
     ``peek`` is optional (used by the inspection views) and may return ``None`` when a
     backend cannot answer without mutating state.
 
-    ``hit_many`` / ``peek_many`` evaluate several rules at once; the default implementation
-    loops over ``hit`` / ``peek``, a backend with a richer protocol (Redis + Lua) overrides
-    them to do it in one round trip.
+    ``hit_many`` / ``peek_many`` evaluate several rules at once; the Redis backend does it in
+    one round trip. A third-party backend may implement only ``hit`` / ``reset``: the default
+    ``hit_many`` loops over ``hit`` (without rollback) and adds the first-crossing marker.
 
     Lockout support (``count_violation`` / ``lock`` / ``locked_until`` / ``unlock``) is
     implemented here on top of the plain cache API and works for every backend."""
@@ -63,16 +89,34 @@ class BaseBackend:
         raise NotImplementedError
 
     def hit_many(self, specs: Sequence[HitSpec]) -> list[HitResult]:
-        return [self.hit(*spec) for spec in specs]
+        results = []
+        for spec in specs:
+            client, rule, window, limit, _enforce = spec_parts(spec)
+            result = self.hit(client, rule, window, limit)
+            if result.first is None and result.exceeded:
+                result = replace(result, first=self.first_crossing(client, rule, window))
+            results.append(result)
+        return results
 
     def peek_many(self, specs: Sequence[HitSpec]) -> list[HitResult] | None:
         results = []
         for spec in specs:
-            result = self.peek(*spec)
+            client, rule, window, limit, _enforce = spec_parts(spec)
+            result = self.peek(client, rule, window, limit)
             if result is None:
                 return None
             results.append(result)
         return results
+
+    # -- first-crossing marker ----------------------------------------------------
+
+    def _marker_key(self, client: str, rule: str) -> str:
+        return f"{self.prefix}:x:{rule}:{client}"
+
+    def first_crossing(self, client: str, rule: str, ttl: int) -> bool:
+        """True the first time it is called for ``client``/``rule`` within ``ttl`` seconds
+        (atomic ``add``). Drives the once-per-window notification."""
+        return bool(self.cache.add(self._marker_key(client, rule), 1, timeout=max(ttl, 1)))
 
     # -- lockout ----------------------------------------------------------------
 
@@ -113,3 +157,11 @@ class BaseBackend:
         except ValueError:  # expired between add and incr
             self.cache.set(key, 1, timeout=ttl)
             return 1
+
+    def _decr(self, key: str) -> None:
+        """Undo one ``_incr`` (rollback of a rejected request). A key that expired in
+        between simply stays gone."""
+        try:
+            self.cache.decr(key)
+        except ValueError:
+            pass

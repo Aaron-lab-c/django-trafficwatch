@@ -140,3 +140,29 @@ def test_log_interval_zero_is_allowed(tw):
     assert check_trafficwatch_settings(None) == []
     tw(FAIL_OPEN_LOG_INTERVAL=-1)
     assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E002"]
+
+
+@locmem_only
+@pytest.mark.parametrize(
+    "backend, expected",
+    [
+        ("django.core.cache.backends.filebased.FileBasedCache", "trafficwatch.W007"),
+        ("django.core.cache.backends.db.DatabaseCache", "trafficwatch.W007"),
+        ("django.core.cache.backends.dummy.DummyCache", "trafficwatch.E014"),
+    ],
+)
+def test_non_atomic_caches_are_reported(settings, backend, expected):
+    settings.CACHES = {"default": {"BACKEND": backend, "LOCATION": "/tmp/x"}}
+    assert ids(check_trafficwatch_settings(None)) == [expected]
+
+
+def test_zero_or_negative_limits_error_once(tw):
+    tw(MAX_REQUESTS=0)
+    assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E002"]
+    tw(MAX_REQUESTS=-1, WINDOW_SECONDS=0)
+    assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E002", "trafficwatch.E002"]
+
+
+def test_bad_status_and_recent_error(tw):
+    tw(BLOCK_STATUS=42, RECENT_VIOLATIONS=-1)
+    assert ids(check_trafficwatch_settings(None)) == ["trafficwatch.E015", "trafficwatch.E015"]
